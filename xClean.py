@@ -85,7 +85,7 @@ When method=1, sets the h (strength) parameter of KNLMeansCL. Default=8.0
 
 """
 
-def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, method=0, methodboost=1, boost=5, outbits=None, rgmode=18, p1=None, b1=None):
+def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, method=0, methodboost=1, boost=0, outbits=None, rgmode=18, p1=None, b1=None):
     defH = max(clip.height, clip.width // 4 * 3) # Resolution calculation for auto blksize settings
     sharp = min(max(sharp, 0), 24) # Sharp multiplier
     rn = min(max(rn, 0), 20) # Luma ReNoise strength
@@ -363,3 +363,9 @@ def Sharpen(clip: vs.VideoNode, amountH = 1.0, amountV = None, planes = None) ->
         clip = core.std.Convolution(clip, conv_mat_h, planes=planes, mode='h')
 
     return clip
+
+
+#def DetectDark(clip):
+    # Trim the brighest luma if less than 15% of pixels
+    #bright = core.std.Expr(clips=clip, expr=["x 204 > 255 0 ?", ""])
+    #brigh

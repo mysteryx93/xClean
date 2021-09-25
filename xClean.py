@@ -191,7 +191,7 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
     # Unsharp filter for spatial detail enhancement
     if sharp:
         if sharp <= 50:
-            clsharp = core.std.MakeDiff(clean, Sharpen(clean2, amountH=-0.08+0.03*sharp))
+            clsharp = core.std.MakeDiff(clean, Sharpen(clean2, amountH=-0.08-0.03*sharp))
         else:
             clsharp = core.std.MakeDiff(clean, clean2.tcanny.TCanny(sigma=(sharp-46)/4, mode=-1))
         clsharp = core.std.MergeDiff(clean2, RE(clsharp.tmedian.TemporalMedian(), clsharp, 12))

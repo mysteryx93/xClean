@@ -97,6 +97,11 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
     b1 = b1 or 400 if methodboost == 0 else 8 if methodboost == 1 else 0
     bd = clip.format.bits_per_sample
     icalc = clip.format.sample_type != vs.FLOAT
+    ditherbits = outbits = outbits or bd
+    if outbits > 8 and outbits < 16:
+        outbits = 16
+    if deband or depth: # plugins do not support 32-bit
+        outbits = min(outbits, 16)
 
     if not isinstance(clip, vs.VideoNode) or clip.format.color_family != vs.YUV:
         raise TypeError("xClean: This is not a YUV clip!")
@@ -106,12 +111,6 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
         raise ValueError("xClean: methodboost must be 0 (MvTools) or 1 (KNLMeansCL)")
     if method == methodboost and boost > 0:
         raise ValueError("xClean: method and methodboost must be different")
-
-    if outbits is None: # Output bits, default input depth
-        outbits = bd
-
-    if deband or depth:
-        outbits = min(outbits, 16)
 
     RE = core.rgsf.Repair if outbits == 32 else core.rgvs.Repair
     RG = core.rgsf.RemoveGrain if outbits == 32 else core.rgvs.RemoveGrain
@@ -133,11 +132,7 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
     
     # Apply selected denoising method
     clean = Denoise(c, cy, chroma, defH, icalc, outbits, method, p1)
-
-    # Convert to output bit depth (if not done already)
-    if c.format.bits_per_sample != outbits:
-        c = c.fmtc.bitdepth(bits=outbits, dmode=1)
-        cy = cy.fmtc.bitdepth(bits=outbits, dmode=1)
+    if clean.format.bits_per_sample != outbits:
         clean = clean.fmtc.bitdepth(bits=outbits, dmode=1)
 
     # Function: Merge denoise with boost denoise when luma is below boost threshold
@@ -150,7 +145,15 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
     # Boost denoising for dark scenes
     if boost > 0:
         cleanboost = Denoise(c, cy, chroma, defH, icalc, outbits, methodboost, b1)
+        if c.format.bits_per_sample != outbits:
+            cleanboost = cleanboost.fmtc.bitdepth(bits=outbits, dmode=1)
         clean = clean.std.FrameEval(functools.partial(BoostDenoise, clean=clean, cleanboost=cleanboost, thr=boost), prop_src=c.std.PlaneStats())
+
+    # Convert to output bit depth
+    if c.format.bits_per_sample != outbits:
+        c = c.fmtc.bitdepth(bits=outbits, dmode=1)
+        cy = cy.fmtc.bitdepth(bits=outbits, dmode=1)
+        clean = clean.fmtc.bitdepth(bits=outbits, dmode=1)
 
     # Separate luma and chroma
     filt = clean
@@ -214,7 +217,8 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
     # Apply deband
     if deband:
         output = output.f3kdb.Deband(range=16, preset="high" if chroma else "luma", grainy=defH/15, grainc=defH/16 if chroma else 0, output_depth=outbits)
-    return output
+    
+    return output.fmtc.bitdepth(bits=ditherbits, dmode=7)
 
 # Apply specified denoising method
 def Denoise(c, cy, chroma, defH, icalc, outbits, method, p1):
@@ -256,7 +260,6 @@ def MvTools(c, cy, chroma, defH, thSAD, icalc, outbits):
 
     if c.format.bits_per_sample != outbits:
         c = c.fmtc.bitdepth(bits=outbits, dmode=1)
-        cy = cy.fmtc.bitdepth(bits=outbits, dmode=1)
         clean = clean.fmtc.bitdepth(bits=outbits, dmode=1)
 
     uv = core.std.MergeDiff(clean, core.tmedian.TemporalMedian(core.std.MakeDiff(c, clean, [1, 2]), 1, [1, 2]), [1, 2]) if chroma else c

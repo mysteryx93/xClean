@@ -280,8 +280,8 @@ def MvTools(c, cy, chroma, defH, thSAD, icalc, outbits):
 # KnlMeansCL denoising method, useful for dark noisy scenes
 def KnlMeans(clip, str, gpuid, chroma, ref):
     ref = ref.resize.Bicubic(format=clip.format)
-    clean = clip.knlm.KNLMeansCL(d=2, a=3, h=str, device_id=gpuid, channels="Y", rclip=ref)
-    uv = clip.knlm.KNLMeansCL(d=2, a=3, h=str/2, device_id=gpuid, channels="UV", rclip=ref) if chroma else clean
+    clean = clip.knlm.KNLMeansCL(d=3, a=2, h=str, device_id=gpuid, channels="Y", rclip=ref)
+    uv = clip.knlm.KNLMeansCL(d=3, a=2, h=str/2, device_id=gpuid, channels="UV", rclip=ref) if chroma else clean
     return core.std.ShufflePlanes(clips=[clean, uv], planes=[0, 1, 2], colorfamily=vs.YUV)
 
 

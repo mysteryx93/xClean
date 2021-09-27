@@ -63,7 +63,7 @@ are merged at a minimal strength of 50/255.
 
 +++ Boost +++
 Boost denoising using a secondary denoiser for dark scenes, between 0 and 100. 0 to disable.
-Setting a value of 5 means that frames with average luma below 5% will be merged between method and methodboost.
+Setting a value of 5 means that frames with average luma below 5% will be merged between method and boostm.
 It will merge at a ratio of .8 - luma / boost * .8
 
 +++ Method / MethodBoost +++
@@ -85,7 +85,7 @@ When method=1, sets the h (strength) parameter of KNLMeansCL. Default=8.0
 
 """
 
-def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, method=0, methodboost=1, boost=0, outbits=None, rgmode=18, p1=None, p2=None, b1=None, b2=None):
+def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, method=0, boostm=1, finalm=2, boost=0, outbits=None, rgmode=18, p1=None, p2=None, b1=None, b2=None, f1=None, f2=None):
     defH = max(clip.height, clip.width // 4 * 3) # Resolution calculation for auto blksize settings
     sharp = min(max(sharp, 0), 24) # Sharp multiplier
     rn = min(max(rn, 0), 20) # Luma ReNoise strength
@@ -94,9 +94,11 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
     strength = min(max(strength, -200), 20) # Strength of denoising
     boost = min(max(boost, 0), 100) # Boost denoise
     p1 = p1 or 400 if method == 0 else 4 if method == 1 else 6 if method == 2 else 0
-    p2 = 0
-    b1 = b1 or 400 if methodboost == 0 else 8 if methodboost == 1 else 6 if method == 2 else 0
-    b2 = 0
+    p2 = p2 or 0
+    b1 = b1 or 400 if boostm == 0 else 8 if boostm == 1 else 8 if method == 2 else 0
+    b2 = b2 or 0
+    f1 = f1 or 1.6 if boostm == 1 else 8 if method == 2 else 0
+    f2 = f2 or 0
     bd = clip.format.bits_per_sample
     icalc = clip.format.sample_type != vs.FLOAT
     ditherbits = outbits = outbits or bd
@@ -109,10 +111,10 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
         raise TypeError("xClean: This is not a YUV clip!")
     if method < 0 or method > 2:
         raise ValueError("xClean: method must be 0 (MvTools), 1 (KNLMeansCL) or 2 (BM3D)")
-    if methodboost < 0 or methodboost > 2:
-        raise ValueError("xClean: methodboost must be 0 (MvTools), 1 (KNLMeansCL) or 2 (BM3D)")
-    if method == methodboost and boost > 0:
-        raise ValueError("xClean: method and methodboost must be different")
+    if boostm < 0 or boostm > 2:
+        raise ValueError("xClean: boostm must be 0 (MvTools), 1 (KNLMeansCL) or 2 (BM3D)")
+    if method == boostm and boost > 0:
+        raise ValueError("xClean: method and boostm must be different")
 
     RE = core.rgsf.Repair if outbits == 32 else core.rgvs.Repair
     RG = core.rgsf.RemoveGrain if outbits == 32 else core.rgvs.RemoveGrain
@@ -133,7 +135,7 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
     cy = core.std.ShufflePlanes(c, [0], vs.GRAY)
     
     # Apply selected denoising method
-    clean = Denoise(c, cy, chroma, defH, icalc, outbits, method, p1, p2)
+    clean = Denoise(c, cy, chroma, defH, icalc, outbits, method, p1, p2, c)
     if clean.format.bits_per_sample != outbits:
         clean = clean.fmtc.bitdepth(bits=outbits, dmode=1)
 
@@ -141,12 +143,13 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
     def BoostDenoise(n, f, clean, cleanboost, thr):
         avg = f.props['PlaneStatsAverage'] * 100
         if avg <= thr and n > 0:
-            clean = core.std.Merge(cleanboost, clean, .8 - avg / thr * .8)
+            clean = cleanboost
+            #clean = core.std.Merge(cleanboost, clean, .8 - avg / thr * .8)
         return clean
         
     # Boost denoising for dark scenes
     if boost > 0:
-        cleanboost = Denoise(c, cy, chroma, defH, icalc, outbits, methodboost, b1, b2)
+        cleanboost = Denoise(c, cy, chroma, defH, icalc, outbits, boostm, b1, b2, clean)
         if c.format.bits_per_sample != outbits:
             cleanboost = cleanboost.fmtc.bitdepth(bits=outbits, dmode=1)
         clean = clean.std.FrameEval(functools.partial(BoostDenoise, clean=clean, cleanboost=cleanboost, thr=boost), prop_src=c.std.PlaneStats())
@@ -175,7 +178,7 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
 
         # Adjust levels while respecting color range of each frame
         def AdjustLevels(n, f, clip, strength):
-            fullRange = '_ColorRange' in f.props and f.props['_ColorRange'] == 1
+            fullRange = '_ColorRange' in f.props and f.props['_ColorRange'] == 0
             return clip.std.Levels((0 if fullRange else 16) - strength, 255 if fullRange else 235, 0.85, 0, 255+strength)
         cleanm = cleanm.std.FrameEval(functools.partial(AdjustLevels, clip=cleanm, strength=strength), prop_src=c)
 
@@ -216,15 +219,21 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
     output = core.std.ShufflePlanes([clean2, filt], [0, 1, 2], vs.YUV)
     output = core.std.MergeDiff(output, core.std.MakeDiff(output.warp.AWarpSharp2(128, 3, 1, depth2, 1), output.warp.AWarpSharp2(128, 2, 1, depth, 1))) if depth else output
 
+    # Apply denoising method with xClean as ref
+    if finalm > 0:
+        output = Denoise(c, cy, chroma, defH, icalc, outbits, finalm, f1, f2, output)
+
     # Apply deband
     if deband:
         output = output.f3kdb.Deband(range=16, preset="high" if chroma else "luma", grainy=defH/15, grainc=defH/16 if chroma else 0, output_depth=outbits)
     
-    return output.fmtc.bitdepth(bits=ditherbits, dmode=7)
+    return output.fmtc.bitdepth(bits=ditherbits, dmode=3)
+
 
 # Apply specified denoising method
-def Denoise(c, cy, chroma, defH, icalc, outbits, method, p1, p2):
-    return MvTools(c, cy, chroma, defH, p1, icalc, outbits) if method == 0 else KnlMeans(c, p1, p2, chroma) if method == 1 else BM3D(c, p1, chroma)
+def Denoise(c, cy, chroma, defH, icalc, outbits, method, p1, p2, ref):
+    return MvTools(c, cy, chroma, defH, p1, icalc, outbits) if method == 0 else KnlMeans(c, p1, p2, chroma, ref) if method == 1 else BM3D(c, p1, chroma)
+
 
 # Default MvTools denoising method
 def MvTools(c, cy, chroma, defH, thSAD, icalc, outbits):
@@ -269,16 +278,18 @@ def MvTools(c, cy, chroma, defH, thSAD, icalc, outbits):
 
 
 # KnlMeansCL denoising method, useful for dark noisy scenes
-def KnlMeans(clip, str, gpuid, chroma):
-    clean = clip.knlm.KNLMeansCL(d=2, a=2, h=str, channels="Y", device_id=gpuid)
-    uv = clean.knlm.KNLMeansCL(d=2, a=2, h=str, channels="UV", device_id=gpuid) if chroma else clip
+def KnlMeans(clip, str, gpuid, chroma, ref):
+    ref = ref.resize.Bicubic(format=clip.format)
+    clean = clip.knlm.KNLMeansCL(d=2, a=3, h=str, device_id=gpuid, channels="Y", rclip=ref)
+    uv = clip.knlm.KNLMeansCL(d=2, a=3, h=str/2, device_id=gpuid, channels="UV", rclip=ref) if chroma else clean
     return core.std.ShufflePlanes(clips=[clean, uv], planes=[0, 1, 2], colorfamily=vs.YUV)
+
 
 # BM3D denoising method
 def BM3D(clip, str, chroma):
-    clean = clip.resize.Bicubic(format=vs.YUV444PS) if chroma else clip.fmtc.bitdepth(bits=32, dmode=1)
-    clean = clean.bm3dcuda_rtc.BM3D(sigma=[str,str,str], chroma=chroma)
-    return clean.resize.Bicubic(format=clip.format)
+    clean = clip.resize.Bicubic(format=vs.RGBS, matrix_in_s="709") if chroma else clip.fmtc.bitdepth(bits=32, dmode=1)
+    clean = clean.bm3dcuda.BM3D(sigma=[str,str,str])
+    return clean.resize.Bicubic(format=clip.format, matrix_s="709")
 
 
 def Tweak(clip, hue=None, sat=None, bright=None, cont=None, coring=True):

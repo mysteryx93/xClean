@@ -148,7 +148,7 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
     if finalm > -1:
         ref = output
         output = Denoise(c, chroma, defH, icalc, outbits, finalm, f1, f2, ref)
-        output = PostProcessing(output, c, defH, outbits, strength, finalm, strength, rn, depth, rgmode)
+        output = PostProcessing(output, c, defH, outbits, strength, finalm, sharp, rn, depth, rgmode)
     
     # Apply deband
     if deband:
@@ -172,7 +172,7 @@ def PostProcessing(clean, c, defH, outbits, strength, method, sharp, rn, depth, 
 
     # Spatial luma denoising
     RG = core.rgsf.RemoveGrain if outbits == 32 else core.rgvs.RemoveGrain
-    clean2 = RG(clean, 17) if rgmode > 0 else clean
+    clean2 = RG(clean, rgmode) if rgmode > 0 else clean
 
     # Apply dynamic noise reduction strength based on Luma
     if strength <= 0:

@@ -81,7 +81,7 @@ For method = 2 (B3MD): p1 = sigma strength (default=9.0), p2 = radius (default=1
 
 """
 
-def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, method=0, boostm=1, finalm=0, boost=0, outbits=None, rgmode=18, p1=None, p2=None, b1=None, b2=None, f1=None, f2=None):
+def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, method=0, boostm=1, finalm=-1, boost=0, outbits=None, rgmode=18, p1=None, p2=None, b1=None, b2=None, f1=None, f2=None):
     defH = max(clip.height, clip.width // 4 * 3) # Resolution calculation for auto blksize settings
     sharp = min(max(sharp, 0), 24) # Sharp multiplier
     rn = min(max(rn, 0), 20) # Luma ReNoise strength
@@ -90,11 +90,11 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
     strength = min(max(strength, -200), 20) # Strength of denoising
     boost = min(max(boost, 0), 100) # Boost denoise
     p1 = p1 or 400 if method == 0 else 1.4 if method == 1 else 9 if method == 2 else 0
-    p2 = p2 or 1 if method == 2 else 0
+    p2 = p2 or 1
     b1 = b1 or 400 if boostm == 0 else 1.4 if boostm == 1 else 9 if boostm == 2 else 0
-    b2 = b2 or 1 if boostm == 2 else 0
+    b2 = b2 or 0
     f1 = f1 or 400 if finalm == 0 else 1.4 if finalm == 1 else 9 if finalm == 2 else 0
-    f2 = f2 or 1 if finalm == 2 else 0
+    f2 = f2 or 0
     bd = clip.format.bits_per_sample
     icalc = clip.format.sample_type != vs.FLOAT
     ditherbits = outbits = outbits or bd
@@ -109,13 +109,6 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
         raise ValueError("xClean: method must be 0 (MvTools), 1 (KNLMeansCL) or 2 (BM3D)")
     if boostm < 0 or boostm > 2:
         raise ValueError("xClean: boostm must be 0 (MvTools), 1 (KNLMeansCL) or 2 (BM3D)")
-
-    if sharp > 20:
-        sharp += 30
-    elif defH <= 2500:
-        sharp = 15 + defH * sharp * 0.0007
-    else:
-        sharp = 50
 
     # Eliminate impulsive noise
     c = core.vcm.Median(clip, plane=[0, 1, 1]) if chroma else clip
@@ -149,15 +142,14 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
         clean = clean.fmtc.bitdepth(bits=outbits, dmode=1)
 
     # Post-processing, renoise & sharpening
-    output = PostProcessing(clean, c, defH, outbits, strength, sharp, rn, depth, rgmode)
+    output = PostProcessing(clean, c, defH, outbits, strength, method, sharp, rn, depth if finalm<0 else 0, rgmode)
 
     # Apply denoising method with xClean as ref
-    if finalm > 0:
+    if finalm > -1:
         ref = output
         output = Denoise(c, chroma, defH, icalc, outbits, finalm, f1, f2, ref)
-        # Only re-apply strength
-        output = PostProcessing(output, c, defH, outbits, strength, 0, 0, 0, 0)
-
+        output = PostProcessing(output, c, defH, outbits, strength, finalm, strength, rn, depth, rgmode)
+    
     # Apply deband
     if deband:
         output = output.f3kdb.Deband(range=16, preset="high" if chroma else "luma", grainy=defH/15, grainc=defH/16 if chroma else 0, output_depth=outbits)
@@ -165,7 +157,14 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=-50, 
     return output.fmtc.bitdepth(bits=ditherbits, dmode=3)
 
 
-def PostProcessing(clean, c, defH, outbits, strength, sharp, rn, depth, rgmode):
+def PostProcessing(clean, c, defH, outbits, strength, method, sharp, rn, depth, rgmode):
+    # Only apply renoise & sharpen to MVTools method
+    if rgmode == 0:
+        sharp = 0
+        rn = 0
+        depth = 0
+        rgmode = 0
+    
     # Separate luma and chroma
     filt = clean
     clean = core.std.ShufflePlanes(clean, [0], vs.GRAY) if clean.format.num_planes != 1 else clean
@@ -173,7 +172,7 @@ def PostProcessing(clean, c, defH, outbits, strength, sharp, rn, depth, rgmode):
 
     # Spatial luma denoising
     RG = core.rgsf.RemoveGrain if outbits == 32 else core.rgvs.RemoveGrain
-    clean2 = RG(clean, rgmode) if rgmode > 0 else clean
+    clean2 = RG(clean, 17) if rgmode > 0 else clean
 
     # Apply dynamic noise reduction strength based on Luma
     if strength <= 0:
@@ -208,10 +207,13 @@ def PostProcessing(clean, c, defH, outbits, strength, sharp, rn, depth, rgmode):
     # Unsharp filter for spatial detail enhancement
     if sharp:
         RE = core.rgsf.Repair if outbits == 32 else core.rgvs.Repair
-        if sharp <= 50:
-            clsharp = core.std.MakeDiff(clean, Sharpen(clean2, amountH=-0.08-0.03*sharp))
+        mult = .69 if method == 1 else .14 if method == 2 else 1
+        if sharp > 20:
+            sharp = (((sharp - 16) / 4) - 1) * mult + 1
+            clsharp = core.std.MakeDiff(clean, clean2.tcanny.TCanny(sigma=sharp, mode=-1))
         else:
-            clsharp = core.std.MakeDiff(clean, clean2.tcanny.TCanny(sigma=(sharp-46)/4, mode=-1))
+            sharp = min(50, (15 + defH * sharp * 0.0007) * mult)
+            clsharp = core.std.MakeDiff(clean, Sharpen(clean2, amountH=-0.08-0.03*sharp))
         clsharp = core.std.MergeDiff(clean2, RE(clsharp.tmedian.TemporalMedian(), clsharp, 12))
     
     # If selected, combining ReNoise
@@ -235,11 +237,11 @@ def PostProcessing(clean, c, defH, outbits, strength, sharp, rn, depth, rgmode):
 
 # Apply specified denoising method
 def Denoise(c, chroma, defH, icalc, outbits, method, p1, p2, ref):
-    return MvTools(c, chroma, defH, p1, icalc, outbits) if method == 0 else KnlMeans(c, p1, p2, chroma, ref) if method == 1 else BM3D(c, p1, p2, chroma, ref)
+    return MvTools(c, chroma, defH, p1, icalc, outbits, ref) if method == 0 else KnlMeans(c, p1, p2, chroma, ref) if method == 1 else BM3D(c, p1, p2, chroma, ref)
 
 
 # Default MvTools denoising method
-def MvTools(c, chroma, defH, thSAD, icalc, outbits):
+def MvTools(c, chroma, defH, thSAD, icalc, outbits, ref):
     cy = core.std.ShufflePlanes(c, [0], vs.GRAY)
     S = core.mv.Super if icalc else core.mvsf.Super
     A = core.mv.Analyse if icalc else core.mvsf.Analyse
@@ -252,7 +254,7 @@ def MvTools(c, chroma, defH, thSAD, icalc, outbits):
     lampa = 777 * (bs ** 2) // 64
     truemotion = False if defH > 720 else True
 
-    super1 = S(c if chroma else cy, hpad=bs, vpad=bs, pel=pel, rfilter=4, sharp=1)
+    super1 = S(ref if chroma else core.std.ShufflePlanes(ref, [0], vs.GRAY), hpad=bs, vpad=bs, pel=pel, rfilter=4, sharp=1)
     super2 = S(c if chroma else cy, hpad=bs, vpad=bs, pel=pel, rfilter=1, levels=1)
     analyse_args = dict(blksize=bs, overlap=ov, search=5, truemotion=truemotion)
     recalculate_args = dict(blksize=bs, overlap=ov, search=5, truemotion=truemotion, thsad=180, _lambda=lampa)
@@ -293,7 +295,7 @@ def KnlMeans(clip, str, gpuid, chroma, ref):
 def BM3D(clip, str, radius, chroma, ref):
     clean = clip.resize.Bicubic(format=vs.YUV444PS, matrix_in_s="709") if chroma else clip.fmtc.bitdepth(bits=32, dmode=1)
     ref = ref.resize.Bicubic(format=vs.YUV444PS, matrix_in_s="709") if chroma else ref.fmtc.bitdepth(bits=32, dmode=1)
-    clean = clean.bm3dcuda.BM3D(sigma=[str,str,str], radius=radius, ref=ref)
+    clean = clean.bm3dcuda.BM3D(sigma=[str,str,str], radius=radius, ref=ref, fast=False)
     if radius > 0:
         clean = clean.bm3d.VAggregate(radius=radius)
     return clean.resize.Bicubic(format=clip.format, matrix_s="709", range = 1)

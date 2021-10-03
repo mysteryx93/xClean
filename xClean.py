@@ -114,8 +114,12 @@ def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=20, m
     # Apply MVTools
     output = clean = c
     if m1 > 0:
-        clean = MvTools(c32 if m1==3 else c16 if m1==2 else c, c32 if m1==3 else c16, chroma, defH, thsad)
-        output = PostProcessing(clean, c32 if m1==3 else c16, defH, strength, sharp, rn, depth if m2==0 else 0, rgmode, 0)
+        c1 = c32 if m1 == 3 else c16 if m1 == 2 else c.resize.Bicubic((c.width * m1)//2*2, (c.height * m1)//2*2) if m1 < 1 else c
+        c1post = c32 if m1==3 else c1.fmtc.bitdepth(bits=16, dmode=1) if m1 < 1 else c16
+        clean = MvTools(c1, chroma, defH, thsad)
+        output = PostProcessing(clean, c1post, defH, strength, sharp, rn, depth if m2==0 else 0, rgmode, 0)
+        if m1 < 1:
+            output = output.resize.Bicubic(c.width, c.height)
 
     # Apply BM3D
     if m2 > 0:
@@ -232,9 +236,9 @@ def PostProcessing(clean, c, defH, strength, sharp, rn, depth, rgmode, method):
 
 
 # Default MvTools denoising method
-def MvTools(c, c16, chroma, defH, thSAD):
-    ref = c.std.Convolution(matrix=[1, 2, 1, 2, 4, 2, 1, 2, 1])
-    icalc = c.format.bits_per_sample < 32
+def MvTools(c, chroma, defH, thSAD):
+    bd = c.format.bits_per_sample
+    icalc = bd < 32
     cy = core.std.ShufflePlanes(c, [0], vs.GRAY)
     S = core.mv.Super if icalc else core.mvsf.Super
     A = core.mv.Analyse if icalc else core.mvsf.Analyse
@@ -247,6 +251,7 @@ def MvTools(c, c16, chroma, defH, thSAD):
     lampa = 777 * (bs ** 2) // 64
     truemotion = False if defH > 720 else True
 
+    ref = c.std.Convolution(matrix=[1, 2, 1, 2, 4, 2, 1, 2, 1])
     super1 = S(ref if chroma else core.std.ShufflePlanes(ref, [0], vs.GRAY), hpad=bs, vpad=bs, pel=pel, rfilter=4, sharp=1)
     super2 = S(c if chroma else cy, hpad=bs, vpad=bs, pel=pel, rfilter=1, levels=1)
     analyse_args = dict(blksize=bs, overlap=ov, search=5, truemotion=truemotion)
@@ -263,15 +268,16 @@ def MvTools(c, c16, chroma, defH, thSAD):
     fvec4 = R(super1, A(super1, isb=False, delta=4, **analyse_args), **recalculate_args) if not icalc else None
 
     # Applying cleaning
-    if not icalc:
-        clean = core.mvsf.Degrain4(c if chroma else cy, super2, bvec1, fvec1, bvec2, fvec2, bvec3, fvec3, bvec4, fvec4, thsad=thSAD)
-    else:
+    if icalc:
         clean = core.mv.Degrain3(c if chroma else cy, super2, bvec1, fvec1, bvec2, fvec2, bvec3, fvec3, thsad=thSAD)
+    else:
+        clean = core.mvsf.Degrain4(c if chroma else cy, super2, bvec1, fvec1, bvec2, fvec2, bvec3, fvec3, bvec4, fvec4, thsad=thSAD)
 
-    #if clean.format.bits_per_sample < 16:
-    clean = clean.fmtc.bitdepth(bits=16, dmode=1)
+    if bd < 16:
+        clean = clean.fmtc.bitdepth(bits=16, dmode=1)
+        c = c.fmtc.bitdepth(bits=16, dmode=1)
 
-    uv = core.std.MergeDiff(clean, core.tmedian.TemporalMedian(core.std.MakeDiff(c16, clean, [1, 2]), 1, [1, 2]), [1, 2]) if chroma else c16
+    uv = core.std.MergeDiff(clean, core.tmedian.TemporalMedian(core.std.MakeDiff(c, clean, [1, 2]), 1, [1, 2]), [1, 2]) if chroma else c
     return core.std.ShufflePlanes(clips=[clean, uv], planes=[0, 1, 2], colorfamily=vs.YUV)
 
 

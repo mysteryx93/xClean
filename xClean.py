@@ -1,109 +1,200 @@
 from vapoursynth import core
+from typing import Optional
 import vapoursynth as vs
 import math, functools
 
 """
-xClean spatio/temporal denoiser beta 1 (2021-09-24)
+xClean 3-pass denoiser beta 2 (2021-10-04)
+Supported formats: YUV or GRAY
+Requires: rgsv, rgvs, fmtc, mv, mvsf, tmedian
 
-Based on mClean (https://forum.doom9.org/showthread.php?t=174804) by burfadel
+xClean runs MVTools -> BM3D -> KNLMeans in that order, passing the output of each pass as the ref of the next denoiser.
 
-Mod by Etienne Charland:
-- Added dynamic noise reduction strength based on Luma where dark areas get full reduction and 
-white areas preserve more of the source. Set Strength between 0 and -200, recommended -50. A value of -50 means that out of 255 values (or 219 tv range), 
-the 50 blackest values have full-reduction and the 50 whitest values are merged at a minimal strength of 50/255.
-- Strength no longer apply to deband and sharpen, only to noise reduction.
-- Deband was denoised and then sharpened. It has been moved to the end after sharpening.
-- Veed is run between noise reduction and sharpening and is not affected by strength.
-- Added boost denoising to denoise dark scenes using a different method (KNLMeansCL).
-- Now support various denoising methods: MvTools2 (default) and KNLMeansCL (default for boost)
-- thSAD parameter has been replaced by p1, which sets thSAD for MvTools2 and h for KNLMeansCL
-- Can now run KNLMeansCL with renoise and sharpen using method=1
+The objective is to remove noise while preserving as much details as possible. Removing noise is easy -- just blur out everything.
+The hard work is in preserving the details in a way that feels natural.
 
-Requires: rgsv, rgvs, fmtc, vcm, mv, mvsf, tmedian
 
-+++ Description +++
-Typical spatial filters work by removing large variations in the image on a small scale, reducing noise but also making the image less
-sharp or temporally stable. xClean removes noise whilst retaining as much detail as possible, as well as provide optional image enhancement.
+Short Doc: Default settings provide the best quality in most cases. Simply use
+xClean(sharp=..., outbits=...)
+For top quality, you can add d=3.
 
-xClean works primarily in the temporal domain, although there is some spatial limiting.
-Chroma is processed a little differently to luma for optimal results.
-Chroma processing can be disabled with chroma = False.
 
-+++ Artifacts +++
-Spatial picture artifacts may remain as removing them is a fine balance between removing the unwanted artifact whilst not removing detail.
-Additional dering/dehalo/deblock filters may be required, but should ONLY be uses if required due the detail loss/artifact removal balance.
+Long version
 
-+++ Sharpening +++
-Applies a modified unsharp mask to edges and major detected detail. Range of normal sharpening is 0-20. There are 4 additional settings,
-21-24 that provide 'overboost' sharpening. Overboost sharpening is only suitable typically for high definition, high quality sources.
+KNLMeans does a good job at denoising but can soften the image, lose details and give an artificial plastic look. I found that on any given source
+(tested 5K GoPro footage and noisy WebCam), denoising with less than h=1.4 looks too noisy, and anything above it blurs out the details. 
+I thus run it at 1.4 strength. KNLMeans also keeps a lot of data from the clip passed as rclip, so doing a good prefilter highly impacts the output.
+
+Similarly, BM3D performs best with sigma=9. A lower value doesn't remove enough noise, and a higher value only makes the edges sharper.
+
+xClean is essentially KNLMeans with advanced pre-filtering and with post-processing to renoise & sharpen to make the image look more natural.
+
+One strange aspect of xClean is that denoising is automatic and there's very little room to configure denoising strength other than reducing it.
+It runs with BM3D sigma=9 and KNL h=1.4, and generally you shouldn't change that. One setting that can allow increasing denoising (and performance)
+is downscaling MVTools pass.
+
+According to my tests, water & cliff 5K video with little noise preserves the details very well while removing subtle grain, and with same settings,
+very noisy 720p WebCam footage has HUGE noise reduction while preserving a surprising amount of natural details.
+
+The default settings are very tolerant to various types of clips.
+
+
+++ Denoising Methods Overview +++
+
+To provide the best output, processing is done in 3 passes, passing the output of one pass as the ref clip of the 2nd pass. Each denoiser has its strengths and weaknesses.
+
+Pass 1: MVTools
+Strength: Removes a lot of noise, good at removing temporal noise.
+Weakness: Can remove too much, especially with delicate textures like water.
+Ref: Impacts vectors analysis but low impact on outcome (running simple convolution matrix on ref)
+
+Pass 2: BM3D
+Strength: Good at preserving fine details!
+Weakness: Doesn't remove much grain. Poor temporal stability.
+Ref: Moderate impact on outcome. A blurry ref will remove more grain while BM3D puts back a lot of details.
+radius=1 provides nearly no benefit at huge performance cost since MVTools already does temporal analysis
+
+Pass 3: KNLMeansCL
+Strength: Best general-purpose denoiser
+Weakness: Can blur out details and give an artificial plastic effect
+Ref: Highly impacts the outcome. All prefilters benefit from running KNLMeans over it.
+By default it runs with d=2, a=2. You can set d=3 for slight quality improvement.
+
+MVTools + BM3D
+Strength: Keeps a lot of details with good denoising of fine details as well as larger grain. Single frames can look great.
+Weakness: Poor noise temporal stability. The video doesn't look as good as single frames.
+
+MVTools + KNLMeans
+Strength: KNLMeans with extra denoising. Works best in most circumstances.
+Weakness: Delicate textures like water or fog will suffer.
+
+MVTools + BM3D + KNLMeans
+Strength: Like MvTools+KNLMeans but preserves details with delicate textures. Works best for any kind of content tested.
+Weakness: Performance and memory usage.
+
+
++++ Denoising Pass Configuration (m1, m2, m3) +++
+
+Each pass (method) can be configured with m1 (MVTools), m2 (BM3D) and m3 (KNLMeansCL) parameters to run at desired bitdepth.
+This means you can fine-tune for quality vs performance.
+
+0 = Disabled, 1 = 8-bit, 2 = 16-bit, 3 = 16-bit YUV444, 4 = 32-bit YUV444
+
+Note: BM3D always processes in 32-bit, KNLMeansCL always processes in 16-bit+, and post-processing always processes in 16-bit+, so certain
+values such as m2=1, m3=1 will behave the same as m2=2, m3=2. Setting m2=3 will only affect BM3D post-processing (YUV444P16 instead of YUV420P16)
+
+MVTools pass (m1) can also be downscaled for huge performance gain, and it even improves quality by bluring more noise before analysis.
+Resizing by a factor of .6 provides the best quality in my tests, and .5 works best if you want that extra performance.
+
+Optional resize factor is set after the dot:
+m1 = .6 or 1.6 processes in 8-bit at 60% of the size. m1 = 2.6 processes in 16-bit at 60% of the size.
+
+Default configuration is m1=.6, m2=3, m3=3 which will provide the best quality in most cases.
+
+For better performance, you can disable m1 for videos with delicate textures and low noise, or disable m2 for videos with no delicate textures.
+You can also simply resize MVTools pass smaller (.5 or .4) which will produce a bit more blur. If m1=1 (no downsize), you can reduce sharp from 11 to 10.
+
+
++++ Renoise and Sharpen (sharp) +++
+
+The idea comes from mClean by Burfadel (https://forum.doom9.org/showthread.php?t=174804) and the algorithm was changed by someone else while porting 
+to VapourSynth, producing completely different results -- original Avisynth version blurs a lot more, VapourSynth version keeps a lot more details.
+
+It may sound counter-productive at first, but the idea is to combat the flat or plastic effect of denoising by re-introducing part of the removed noise.
+The noise is processed and stabilized before re-inserting so that it's less distracting.
+
+Using the same analysis data, it's also sharpening to compensate for denoising blur.
+
+Normal sharpening must be between 0 and 20. 21-24 provide 'overboost' sharpening, generally only suitable for high definition, high quality sources.
 Actual sharpening calculation is scaled based on resolution.
 
-+++ ReNoise +++
-ReNoise adds back some of the removed luma noise. Re-adding original noise would be counterproductive, therefore ReNoise modifies this noise
-both spatially and temporally. The result of this modification is the noise becomes much nicer and it's impact on compressibility is greatly
-reduced. It is not applied on areas where the sharpening occurs as that would be counterproductive. Settings range from 0 to 20.
-The strength of renoise is affected by the the amount of original noise removed and how this noise varies between frames.
-It's main purpose is to reduce the 'flatness' that occurs with any form of effective denoising.
+Default: 11. Much less sharpening is required than mClean due to the way denoisers are chained.
 
-+++ Deband +++
-This will perceptibly improve the quality of the image by reducing banding effect and adding a small amount of temporally stabilised grain
-to both luma and chroma. The settings are not adjustable as the default settings are suitable for most cases without having a large effect
-on compressibility. 0 = disabled, 1 = deband only, 2 = deband and veed
 
-+++ Depth +++
++++ Strength / Dynamic Denoiser Strength (strength) +++
+
+A value of 20 (default) will denoise normally. Set a value around -50 if you only dark areas contain noise.
+
+A value between 1 and 19 will reduce the denoising effect by that factor by partially merging back with the original clip.
+
+A value between 0 and -200 will activate Dynamic Denoiser Strength, useful when bright colors require little or no denoising and dark colors contain more noise.
+It applies a gradual mask based on luma. Specifying a value of -50 means that out of 255 (or 219 tv range), the 50 blackest values have full-reduction 
+and the 50 whitest values are merged at a minimal strength of 50/255 = 20%.
+
+
++++ depth +++
 This applies a modified warp sharpening on the image that may be useful for certain things, and can improve the perception of image depth.
 Settings range up from 0 to 5. This function will distort the image, for animation a setting of 1 or 2 can be beneficial to improve lines.
 
-+++ Strength +++
-The strength of the denoising effect can be adjusted using this parameter. It ranges from 20 percent denoising effect with strength 0, up to the
-100 percent of the denoising with strength 20. This function works by blending a scaled percentage of the original image with the processed image.
-A value between 0 and -200 will apply dynamic noise reduction strength based on Luma, where black zones get full denoising and white areas
-preserve the source. Specifying a value of -50 means that out of 255 (or 219 tv range), the 50 blackest values have full-reduction and the 50 whitest values 
-are merged at a minimal strength of 50/255.
 
-+++ Boost +++
-Boost denoising using a secondary denoiser for dark scenes, between 0 and 100. 0 to disable.
-Setting a value of 5 means that frames with average luma below 5% will be merged between method and boostm.
-It will merge at a ratio of .8 - luma / boost * .8
++++ deband +++
+This will perceptibly improve the quality of the image by reducing banding effect and adding a small amount of temporally stabilised grain
+to both luma and chroma. The settings are not adjustable as the default settings are suitable for most cases without having a large effect
+on compressibility. 0 = disabled, 1 = deband
 
-+++ Method / MethodBoost +++
-0 for MvTools (default), 1 for KNLMeansCL (default for dark scene boost)
 
-+++ Outbits +++
-Specifies the bits per component (bpc) for the output for processing by additional filters. It will also be the bpc that xClean will process.
-If you output at a higher bpc keep in mind that there may be limitations to what subsequent filters and the encoder may support.
++++ outbits, dmode +++
+Specifies the output bitdepth. If not specified it will be converted back to the bitdepth of the source clip using dithering method specified by dmode.
 
-+++ p1, p2, b1, b2, f1, f2 +++
-Parameters to configure denoising for method(p1/p2), boostm(b1/b2) and finalm(f1/f2)
-For method = 0 (MVTools2): p1 = thSAD used for analysis (default=400)
-For method = 1 (KNLMeansCL): p1 = h strength (default=1.4), p2 = device_id (default=0)
-For method = 2 (B3MD): p1 = sigma strength (default=9.0), p2 = radius (default=1)
+
++++ chroma +++
+True to process both Luma and Chroma planes, False to process only Luma. Default: True
+
+
++++ Advanced Settings +++
+gpuid = 0, the GPU id to use for KNLMeans and BM3D
+d = 2, KNLMeans 'd' parameter, can be set to 3 for small quality improvement
+
+Normally you shouldn't have to touch these
+rgmode = 18, RemoveGrain mode used during post-processing. Setting this to 0 disables post-processing, useful to compare raw denoising.
+thsad = 400, threshold used for MVTools analysis
+a = 2, KNLMeans 'a' parameter
+h = 1.4, KNLMeans 'h' parameter
+sigma = 9, BM3D 'sigma' parameter
+
+
+Deband and dithering should always be applied at the very end of your script. If you plan to do further processing, disable deband and using ordered dithering method.
+
+TODO
+- YUV420 or YUV444 output?
+- veed, autolevels... include or not?
+- Allow disabling GPU acceleration for both KNLMeans and BM3D, separately
+- Support GRAY formats and test chroma=False
 
 """
 
-def xClean(clip, chroma=True, sharp=10, rn=14, deband=0, depth=0, strength=20, m1=.6, m2=3, m3=3, outbits=None, dmode=3, rgmode=18, thsad=400, d=2, a=2, h=1.4, gpuid=0, sigma=9):
-    if not isinstance(clip, vs.VideoNode) or clip.format.color_family != vs.YUV:
-        raise TypeError("xClean: This is not a YUV clip!")
+def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: int = 11, rn: int = 14, deband: int = 0, depth: int = 0, strength: int = 20, m1: float = .6, m2: int = 3, m3: int = 3, outbits: Optional[int] = None,
+        dmode: int = 3, rgmode: int = 18, thsad: int = 400, d: int = 2, a: int = 2, h: float = 1.4, gpuid: int = 0, sigma: int = 9):
+    #if not isinstance(clip, vs.VideoNode) or clip.format.color_family != vs.YUV:
+    #    raise TypeError("xClean: This is not a YUV clip!")
+    if not clip.format.color_family in [vs.YUV, vs.GRAY]:
+        raise TypeError("xClean: Only YUV or GRAY clips are supported")
 
     defH = max(clip.height, clip.width // 4 * 3) # Resolution calculation for auto blksize settings
-    sharp = min(max(sharp, 0), 24) # Sharp multiplier
-    rn = min(max(rn, 0), 20) # Luma ReNoise strength
-    deband = min(max(deband, 0), 5)  # Apply deband/veed
-    depth = min(max(depth, 0), 5) # Depth enhancement
-    strength = min(max(strength, -200), 20) # Strength of denoising
+    if sharp < 0 or sharp > 24:
+        raise ValueError("xClean: sharp must be between 0 and 24")
+    if rn < 0 or rn > 20:
+        raise ValueError("xClean: rn (renoise strength) must be between 0 and 20")
+    if deband < 0 or deband > 1:
+        raise ValueError("xClean: deband must be between 0 and 1")
+    if depth < 0 or depth > 5:
+        raise ValueError("xClean: depth must be between 0 and 5")
+    if strength < -200 or strength > 20:
+        raise ValueError("xClean: strength must be between -200 and 20")
+    if m1 < 0 or m1 >= 5:
+        raise ValueError(r"xClean: m1 (MVTools pass) can be 0 (disabled), 1 (8-bit), 2 (16-bit), 3 (16-bit YUV444) or 4 (32-bit YUV444), plus an optional downscale ratio as decimal (eg: 2.6 resizes to 60% in 16-bit)")
+    if m2 < 0 or m2 > 4:
+        raise ValueError("xClean: m2 (BM3D pass) can be 0 (disabled), 1 (8-bit), 2 (16-bit), 3 (16-bit YUV444) or 4 (32-bit YUV444)")
+    if m3 < 0 or m3 > 4:
+        raise ValueError("xClean: m3 (KNLMeansCL pass) can be 0 (disabled), 1 (8-bit), 2 (16-bit), 3 (16-bit YUV444) or 4 (32-bit YUV444)")
+    if m1 == 0 and m2 == 0 and m3 == 0:
+        raise ValueError("xClean: At least one pass must be enabled")
+
     bd = clip.format.bits_per_sample
     outbits = outbits or bd
-    #if outbits > 8 and outbits < 16:
-    #    outbits = 16
-    #if deband or depth: # plugins do not support 32-bit
-    #    outbits = min(outbits, 16)
+    if not outbits in [8, 10, 12, 14, 16, 32]:
+        raise ValueError("xClean: outbits must be 8, 10, 12, 14, 16 or 32")
 
-    # if method < 0 or method > 2:
-    #     raise ValueError("xClean: method must be 0 (MvTools), 1 (KNLMeansCL) or 2 (BM3D)")
-    # if boostm < 0 or boostm > 2:
-    #     raise ValueError("xClean: boostm must be 0 (MvTools), 1 (KNLMeansCL) or 2 (BM3D)")
-
-    # Eliminate impulsive noise
     c = clip
     c16 = c.fmtc.bitdepth(bits=16, dmode=1)
     c_444 = c.resize.Bicubic(format=vs.YUV444P8)
@@ -418,9 +509,3 @@ def Sharpen(clip: vs.VideoNode, amountH = 1.0, amountV = None, planes = None) ->
         clip = core.std.Convolution(clip, conv_mat_h, planes=planes, mode='h')
 
     return clip
-
-
-#def DetectDark(clip):
-    # Trim the brighest luma if less than 15% of pixels
-    #bright = core.std.Expr(clips=clip, expr=["x 204 > 255 0 ?", ""])
-    #brigh

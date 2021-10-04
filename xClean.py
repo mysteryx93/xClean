@@ -4,7 +4,8 @@ import vapoursynth as vs
 import math, functools
 
 """
-xClean 3-pass denoiser beta 2 (2021-10-04)
+xClean 3-pass denoiser
+beta 2 (2021-10-04) by Etienne Charland
 Supported formats: YUV or GRAY
 Requires: rgsv, rgvs, fmtc, mv, mvsf, tmedian
 
@@ -39,7 +40,7 @@ very noisy 720p WebCam footage has HUGE noise reduction while preserving a surpr
 The default settings are very tolerant to various types of clips.
 
 
-++ Denoising Methods Overview +++
++++ Denoising Methods Overview +++
 
 To provide the best output, processing is done in 3 passes, passing the output of one pass as the ref clip of the 2nd pass. Each denoiser has its strengths and weaknesses.
 

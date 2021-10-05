@@ -157,6 +157,7 @@ sigma = 9, BM3D 'sigma' parameter
 Deband and dithering should always be applied at the very end of your script. If you plan to do further processing, disable deband and using ordered dithering method.
 
 TODO
+- resize back from BM3D in correct matrix, primaries, transfer, range, chromaposition
 - YUV420 or YUV444 output?
 - veed, autolevels... include or not?
 - Allow disabling GPU acceleration for both KNLMeans and BM3D, separately
@@ -165,7 +166,7 @@ TODO
 """
 
 def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: int = 11, rn: int = 14, deband: int = 0, depth: int = 0, strength: int = 20, m1: float = .6, m2: int = 3, m3: int = 3, outbits: Optional[int] = None,
-        dmode: int = 3, rgmode: int = 18, thsad: int = 400, d: int = 2, a: int = 2, h: float = 1.4, gpuid: int = 0, sigma: int = 9):
+        dmode: int = 3, rgmode: int = 18, thsad: int = 400, d: int = 2, a: int = 2, h: float = 1.4, gpuid: int = 0, sigma: int = 9) -> vs.VideoNode:
     #if not isinstance(clip, vs.VideoNode) or clip.format.color_family != vs.YUV:
     #    raise TypeError("xClean: This is not a YUV clip!")
     if not clip.format.color_family in [vs.YUV, vs.GRAY]:
@@ -222,7 +223,7 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: int = 11, rn: int = 1
     # Apply BM3D
     if m2 > 0:
         ref = output
-        m2o = min(2, max(m2, m3))
+        m2o = max(2, max(m2, m3))
         output = BM3D(c, sigma, gpuid, chroma, ref, m2o)
         c2 = c32_444 if m2o==4 else c16_444 if m2o==3 else c16
         output = PostProcessing(output, c2, defH, strength, sharp, rn, depth, rgmode, 1)

@@ -157,10 +157,7 @@ h = 1.4, KNLMeans 'h' parameter
 sigma = 9, BM3D 'sigma' parameter
 
 
-Advanced dithering should always be applied at the very end of your script. If you plan to do further processing, use ordered dithering method (dmode=0).
-
-TODO
-- resize back from BM3D in correct matrix, primaries, transfer, range, chromaposition
+If you won't be doing further processing, set dither dmode to 3 instead of 0.
 
 """
 

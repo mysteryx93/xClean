@@ -1,14 +1,13 @@
 from vapoursynth import core
 from typing import Optional
 import vapoursynth as vs
-import mvsfunc as mvf
 import math, functools
 
 """
 xClean 3-pass denoiser
 beta 2 (2021-10-04) by Etienne Charland
 Supported formats: YUV or GRAY
-Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian, mvsfunc
+Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian
 
 xClean runs MVTools -> BM3D -> KNLMeans in that order, passing the output of each pass as the ref of the next denoiser.
 
@@ -442,9 +441,10 @@ def BM3D(clip, sigma, gpuid, chroma, ref, m):
     if ref:
         ref = ref.resize.Bicubic(format=vs.RGBS, matrix_in_s="709") if chroma else core.std.ShufflePlanes(ref, [0], vs.GRAY).fmtc.bitdepth(bits=32, dmode=1)
     if gpuid >= 0:
-        clean = core.bm3dcuda.BM3D(clean, sigma=[sigma,sigma,sigma], ref=ref, device_id=gpuid, fast=False)
+        clean = core.bm3dcuda.BM3D(clean, sigma=sigma, ref=ref, device_id=gpuid, fast=False)
     else:
-        clean = mvf.BM3D(clean, sigma=[sigma,sigma,sigma], ref=ref)
+        clean2 = core.bm3d.Basic(clean, sigma=sigma)
+        clean = core.bm3d.Final(clean, clean2, sigma=sigma)
     return ConvertToM(clean, clip, m)
 
 

@@ -7,7 +7,7 @@ import math, functools
 xClean 3-pass denoiser
 beta 2 (2021-10-04) by Etienne Charland
 Supported formats: YUV or GRAY
-Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian
+Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian, knlm, bm3dcuda, bm3dcpu
 
 xClean runs MVTools -> BM3D -> KNLMeans in that order, passing the output of each pass as the ref of the next denoiser.
 
@@ -229,16 +229,16 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: int = 11, rn: int = 1
     if m2 > 0:
         m2o = max(2, max(m2, m3))
         ref = output
-        output = BM3D(c, sigma, gpucuda, chroma, ref, m2o)
         c2 = c32_444 if m2o==4 else c16_444 if m2o==3 else c16
+        output = BM3D(c2, sigma, gpucuda, chroma, ref, m2o)
         output = PostProcessing(output, c2, defH, strength, sharp, rn, depth, rgmode, 1)
     
     # Apply KNLMeans
     if m3 > 0:
         m3 = min(2, m3) # KNL internally computes in 16-bit
         ref = ConvertToM(output, clip, m3) if output else None
-        output = KnlMeans(c, d, a, h, gpuid, chroma, ref)
         c3 = c32_444 if m3==4 else c16_444 if m3==3 else c16
+        output = KnlMeans(c3, d, a, h, gpuid, chroma, ref)
         output = PostProcessing(output, c3, defH, strength, sharp, rn, depth, rgmode, 2)
     
     # Apply deband
@@ -441,16 +441,14 @@ def BM3D(clip, sigma, gpuid, chroma, ref, m):
     if ref:
         ref = ref.resize.Bicubic(format=vs.RGBS, matrix_in_s="709") if chroma else core.std.ShufflePlanes(ref, [0], vs.GRAY).fmtc.bitdepth(bits=32, dmode=1)
     if gpuid >= 0:
-        clean = core.bm3dcuda.BM3D(clean, sigma=sigma, ref=ref, device_id=gpuid, fast=False)
+        clean = core.bm3dcuda.BM3D(clean, sigma=sigma, ref=ref, device_id=gpuid, fast=False, block_step=5, bm_range=15, ps_range=7)
     else:
-        clean2 = core.bm3d.Basic(clean, sigma=sigma)
-        clean = core.bm3d.Final(clean, clean2, sigma=sigma)
+        clean = core.bm3dcpu.BM3D(clean, sigma=sigma, ref=ref, block_step=5, bm_range=15, ps_range=7)
     return ConvertToM(clean, clip, m)
 
 
 # KnlMeansCL denoising method, useful for dark noisy scenes
 def KnlMeans(clip, d, a, h, gpuid, chroma, ref):
-    device = "auto" if gpuid >= 0 else "cpu"
     if ref and ref.format != clip.format:
         ref = ref.resize.Bicubic(format=clip.format)
     device = dict(device_type="auto" if gpuid >= 0 else "cpu", device_id=max(0, gpuid))
@@ -464,23 +462,34 @@ def KnlMeans(clip, d, a, h, gpuid, chroma, ref):
         return core.std.ShufflePlanes(clips=[clean, uv], planes=[0, 1, 2], colorfamily=vs.YUV)
 
 
-def ConvertToM(clip, src, m):
+def ConvertToM(c, src, m):
+    # Convert back while respecting ColorRange, Matrix, ChromaLocation, Transfer and Primaries of each frame. Note that setting range=1 sets _ColorRange=0 (reverse)
+    def ConvertBack(n, f, clip, format):
+        fullRange = "_ColorRange" in f.props and f.props["_ColorRange"] == 0
+        matrix = "_Matrix" in f.props and f.props["_Matrix"]
+        if matrix == 0 or matrix == 2:
+            matrix = 6
+        transfer = "_Transfer" in f.props and f.props["_Transfer"] or 1
+        if transfer == 2:
+            transfer = matrix
+        primaries = "_Primaries" in f.props and f.props["_Primaries"] or 1
+        if primaries == 2:
+            primaries = matrix
+        chroma = "_ChromaLocation" in f.props and f.props["_ChromaLocation"] or 0
+        return clip.resize.Bicubic(format=format, matrix=matrix, chromaloc=chroma, range = 1 if fullRange else 0)
+        # transfer=transfer, primaries=primaries
+
     if src.format.color_family == vs.GRAY:
         fmt = vs.GRAY32 if m == 4 else vs.GRAY16 if m == 3 or m == 2 else vs.GRAY8
     else:
-        fmt = vs.YUV444PS if m == 4 else vs.YUV444P16 if m == 3 else vs.YUV420P16 if clip.format.subsampling_w == 1 and clip.format.subsampling_h == 1 else vs.YUV422P16 if clip.format.subsampling_w == 1 and clip.format.subsampling_h == 0 else vs.YUV444P16
-    if clip.format == fmt:
-        return clip
-    elif clip.format.color_family in [vs.YUV, vs.GRAY]:
-        return clip.resize.Bicubic(format=fmt)
+        samp = ClipSampling(c)
+        fmt = vs.YUV444PS if m == 4 else vs.YUV444P16 if m == 3 else vs.YUV420P16 if samp == "420" else vs.YUV422P16 if samp == "422" else vs.YUV444P16
+    if c.format == fmt:
+        return c
+    elif c.format.color_family in [vs.YUV, vs.GRAY]:
+        return c.resize.Bicubic(format=fmt)
     else:
-        return clip.resize.Bicubic(format=fmt, matrix_s="709", range = 1)
-    
-    # Convert back while respecting _ColorRange of each frame. Note that setting range=1 sets _ColorRange=0 (reverse)
-    def ConvertBack(n, f, clean, format):
-        fullRange = '_ColorRange' in f.props and f.props['_ColorRange'] == 0
-        return clean.resize.Bicubic(format=format, matrix_s="709", range = 1 if fullRange else 0)
-    return clean.std.FrameEval(functools.partial(ConvertBack, clean=clean, format=fmt), prop_src=clip)
+        return core.std.BlankClip(src, format=fmt).std.FrameEval(functools.partial(ConvertBack, clip=c, format=fmt), prop_src=src)
 
 
 def Tweak(clip, hue=None, sat=None, bright=None, cont=None, coring=True):

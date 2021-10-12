@@ -171,7 +171,7 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: int = 11, rn: int = 1
     defH = max(clip.height, clip.width // 4 * 3) # Resolution calculation for auto blksize settings
     if sharp < 0 or sharp > 24:
         raise ValueError("xClean: sharp must be between 0 and 24")
-    if rn < 0 or rn > 20:
+    if rn < 0 or rn > 40:
         raise ValueError("xClean: rn (renoise strength) must be between 0 and 20")
     if depth < 0 or depth > 5:
         raise ValueError("xClean: depth must be between 0 and 5")
@@ -285,7 +285,7 @@ def PostProcessing(clean, c, defH, strength, sharp, rn, depth, rgmode, method):
         if defH > 1200:
             cleanm = cleanm.std.Maximum()
 
-        # Adjust levels while respecting color range of each frame
+        # Adjust mask levels while respecting color range of each frame
         def AdjustLevels(n, f, clip, strength):
             fullRange = '_ColorRange' in f.props and f.props['_ColorRange'] == 0
             return clip.std.Levels((0 if fullRange else 16) - strength, 255 if fullRange else 235, 0.85, 0, 255+strength)
@@ -489,72 +489,44 @@ def ConvertToM(c, src, m):
         return core.std.BlankClip(src, format=fmt).std.FrameEval(functools.partial(ConvertBack, clip=c, format=fmt), prop_src=src)
 
 
-def Tweak(clip, hue=None, sat=None, bright=None, cont=None, coring=True):
-    bd = clip.format.bits_per_sample
-    isFLOAT = clip.format.sample_type == vs.FLOAT
-    isGRAY = clip.format.color_family == vs.GRAY
-    mid = 0 if isFLOAT else 1 << (bd - 1)
+# Adjusts brightness and contrast
+def Tweak(c, bright=None, cont=None):
+    def TweakFunc(n, f, clip, bright, cont):
+        fullRange = "_ColorRange" in f.props and f.props["_ColorRange"] == 0
+        bd = clip.format.bits_per_sample
+        isFLOAT = clip.format.sample_type == vs.FLOAT
+        isGRAY = clip.format.color_family == vs.GRAY
+        mid = 0 if isFLOAT else 1 << (bd - 1)
 
-    if clip.format.color_family == vs.RGB:
-        raise TypeError("Tweak: RGB color family is not supported!")
-        
-    if not (hue is None and sat is None or isGRAY):
-        hue = 0.0 if hue is None else hue
-        sat = 1.0 if sat is None else sat
-        hue = hue * math.pi / 180
-        sinh = math.sin(hue)
-        cosh = math.cos(hue)
-        cmin = -0.5 if isFLOAT else 16 << (bd - 8) if coring else 0
-        cmax = 0.5 if isFLOAT else 240 << (bd - 8) if coring else (1 << bd) - 1
-        expr_u = "x {} * y {} * + -0.5 max 0.5 min".format(cosh * sat, sinh * sat) if isFLOAT else "x {} - {} * y {} - {} * + {} + {} max {} min".format(mid, cosh * sat, mid, sinh * sat, mid, cmin, cmax)
-        expr_v = "y {} * x {} * - -0.5 max 0.5 min".format(cosh * sat, sinh * sat) if isFLOAT else "y {} - {} * x {} - {} * - {} + {} max {} min".format(mid, cosh * sat, mid, sinh * sat, mid, cmin, cmax)
-        src_u = core.std.ShufflePlanes(clip, [1], vs.GRAY)
-        src_v = core.std.ShufflePlanes(clip, [2], vs.GRAY)
-        dst_u = core.std.Expr([src_u, src_v], expr_u)
-        dst_v = core.std.Expr([src_u, src_v], expr_v)
-        clip = core.std.ShufflePlanes([clip, dst_u, dst_v], [0, 0, 0], clip.format.color_family)
+        if clip.format.color_family == vs.RGB:
+            raise TypeError("Tweak: RGB color family is not supported!")
 
-    if not (bright is None and cont is None):
-        bright = 0.0 if bright is None else bright
-        cont = 1.0 if cont is None else cont
+        if not (bright is None and cont is None):
+            bright = 0.0 if bright is None else bright
+            cont = 1.0 if cont is None else cont
 
-        if isFLOAT:
-            expr = "x {} * {} + 0.0 max 1.0 min".format(cont, bright)
-            clip =  core.std.Expr([clip], [expr] if isGRAY else [expr, ''])
-        else:
-            luma_lut = []
-            luma_min = 16  << (bd - 8) if coring else 0
-            luma_max = 235 << (bd - 8) if coring else (1 << bd) - 1
+            if isFLOAT:
+                expr = "x {} * {} + 0.0 max 1.0 min".format(cont, bright)
+                clip =  core.std.Expr([clip], [expr] if isGRAY else [expr, ''])
+            else:
+                luma_lut = []
+                luma_min = 16  << (bd - 8) if not fullRange else 0
+                luma_max = 235 << (bd - 8) if not fullRange else (1 << bd) - 1
 
-            for i in range(1 << bd):
-                val = int((i - luma_min) * cont + bright + luma_min + 0.5)
-                luma_lut.append(min(max(val, luma_min), luma_max))
+                for i in range(1 << bd):
+                    val = int((i - luma_min) * cont + bright + luma_min + 0.5)
+                    luma_lut.append(min(max(val, luma_min), luma_max))
 
-            clip = core.std.Lut(clip, [0], luma_lut)
+                clip = core.std.Lut(clip, [0], luma_lut)
+        return clip
 
-    return clip
+    return c.std.FrameEval(functools.partial(TweakFunc, clip=c, bright=bright, cont=cont), prop_src=c)
+
 
 # from muvsfunc
 def Sharpen(clip: vs.VideoNode, amountH = 1.0, amountV = None, planes = None) -> vs.VideoNode:
-    """Avisynth's internel filter Sharpen()
-    Simple 3x3-kernel sharpening filter.
-    Args:
-        clip: Input clip.
-        amountH, amountV: (float) Sharpen uses the kernel is [(1-2^amount)/2, 2^amount, (1-2^amount)/2].
-            A value of 1.0 gets you a (-1/2, 2, -1/2) for example.
-            Negative Sharpen actually blurs the image.
-            The allowable range for Sharpen is from -1.58 to +1.0.
-            If \"amountV\" is not set manually, it will be set to \"amountH\".
-            Default is 1.0.
-        planes: (int []) Whether to process the corresponding plane. By default, every plane will be processed.
-            The unprocessed planes will be copied from the source clip, "clip".
-    """
-
+    # Avisynth's internel filter Sharpen()
     funcName = 'Sharpen'
-
-    if not isinstance(clip, vs.VideoNode):
-        raise TypeError(funcName + ': \"clip\" is not a clip!')
-
     if amountH < -1.5849625 or amountH > 1:
         raise ValueError(funcName + ': \'amountH\' have not a correct value! [-1.58 ~ 1]')
 
@@ -564,8 +536,7 @@ def Sharpen(clip: vs.VideoNode, amountH = 1.0, amountV = None, planes = None) ->
         if amountV < -1.5849625 or amountV > 1:
             raise ValueError(funcName + ': \'amountV\' have not a correct value! [-1.58 ~ 1]')
 
-    if planes is None:
-        planes = list(range(clip.format.num_planes))
+    planes = list(range(clip.format.num_planes)) if planes is None else planes
 
     center_weight_v = math.floor(2 ** (amountV - 1) * 1023 + 0.5)
     outer_weight_v = math.floor((0.25 - 2 ** (amountV - 2)) * 1023 + 0.5)
@@ -580,7 +551,6 @@ def Sharpen(clip: vs.VideoNode, amountH = 1.0, amountV = None, planes = None) ->
 
     if math.fabs(amountV) >= 0.00002201361136:
         clip = core.std.Convolution(clip, conv_mat_h, planes=planes, mode='h')
-
     return clip
 
 

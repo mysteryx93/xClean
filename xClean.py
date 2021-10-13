@@ -1,7 +1,7 @@
 from vapoursynth import core
-from typing import Optional
 import vapoursynth as vs
-import math, functools
+import math
+from typing import Optional
 
 """
 xClean 3-pass denoiser
@@ -155,7 +155,7 @@ a = 2, h = 1.4: KNLMeans parameter.
 sigma = 9: BM3D parameter.
 """
 
-def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: int = 11, rn: int = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .6, m2: int = 3, m3: int = 3, outbits: Optional[int] = None,
+def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: float = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .6, m2: int = 3, m3: int = 3, outbits: Optional[int] = None,
         dmode: int = 0, rgmode: int = 18, thsad: int = 400, d: int = 2, a: int = 2, h: float = 1.4, gpuid: int = 0, gpucuda: Optional[int] = None, sigma: float = 9, block_step: int = 5, bm_range: int = 15, ps_range: int = 7) -> vs.VideoNode:
     if not clip.format.color_family in [vs.YUV, vs.GRAY]:
         raise TypeError("xClean: Only YUV or GRAY clips are supported")
@@ -163,7 +163,7 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: int = 11, rn: int = 1
     defH = max(clip.height, clip.width // 4 * 3) # Resolution calculation for auto blksize settings
     if sharp < 0 or sharp > 24:
         raise ValueError("xClean: sharp must be between 0 and 24")
-    if rn < 0 or rn > 40:
+    if rn < 0 or rn > 20:
         raise ValueError("xClean: rn (renoise strength) must be between 0 and 20")
     if depth < 0 or depth > 5:
         raise ValueError("xClean: depth must be between 0 and 5")
@@ -210,7 +210,10 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: int = 11, rn: int = 1
         output = MvTools(c1, chroma, defH, thsad) if m1 < 4 else SpotLess(c1, chroma=chroma, radt=3)
         if c1.format.bits_per_sample < 16:
             c1 = c1.fmtc.bitdepth(bits=16, dmode=1)
-        output = PostProcessing(output, c1, defH, strength, sharp, rn, depth if m2==0 else 0, rgmode, 0)
+        # Adjust sharp based on h parameter.
+        # m1=1: sharp=9.6,  m1=.5: sharp=10.3, m1=.3: sharp=10.6
+        sharp1 = max(0, min(24, sharp + (1 - m1r) * 1.35))
+        output = PostProcessing(output, c1, defH, strength, sharp1, rn, rgmode, 0)
         if m1r > 0:
             output = output.resize.Bicubic(c.width, c.height)
 
@@ -220,7 +223,7 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: int = 11, rn: int = 1
         ref = output
         c2 = c32_444 if m2o==4 else c16_444 if m2o==3 else c16
         output = BM3D(c2, sigma, gpucuda, chroma, ref, m2o, block_step, bm_range, ps_range)
-        output = PostProcessing(output, c2, defH, strength, sharp, rn, depth, rgmode, 1)
+        output = PostProcessing(output, c2, defH, strength, sharp, rn, rgmode, 1)
     
     # Apply KNLMeans
     if m3 > 0:
@@ -228,7 +231,16 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: int = 11, rn: int = 1
         ref = ConvertToM(output, clip, m3) if output else None
         c3 = c32_444 if m3==4 else c16_444 if m3==3 else c16
         output = KnlMeans(c3, d, a, h, gpuid, chroma, ref)
-        output = PostProcessing(output, c3, defH, strength, sharp, rn, depth, rgmode, 2)
+        # Adjust sharp based on h parameter.
+        # h=0: sharp=10.3, h=1.4: sharp=10.8, h=2.8: sharp=11.3
+        sharp3 = max(0, min(24, sharp - .5 + (h/2.8)))
+        output = PostProcessing(output, c3, defH, strength, sharp3, rn, rgmode, 2)
+
+    # Add Depth (thicken lines for anime)
+    if depth:
+        depth2 = -depth*3
+        depth = depth*2
+        output = core.std.MergeDiff(output, core.std.MakeDiff(output.warp.AWarpSharp2(128, 3, 1, depth2, 1), output.warp.AWarpSharp2(128, 2, 1, depth, 1)))
     
     # Apply deband
     if deband:
@@ -246,7 +258,7 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: int = 11, rn: int = 1
     return output
 
 
-def PostProcessing(clean: vs.VideoNode, c: vs.VideoNode, defH: int, strength: int, sharp: int, rn: int, depth: int, rgmode: int, method: int) -> vs.VideoNode:
+def PostProcessing(clean: vs.VideoNode, c: vs.VideoNode, defH: int, strength: int, sharp: float, rn: float, rgmode: int, method: int) -> vs.VideoNode:
     # Only apply renoise & sharpen to MVTools method
     if rgmode == 0:
         sharp = 0
@@ -293,8 +305,6 @@ def PostProcessing(clean: vs.VideoNode, c: vs.VideoNode, defH: int, strength: in
 
     i = 0.00392 if bd == 32 else 1 << (bd - 8)
     peak = 1.0 if bd == 32 else (1 << bd) - 1
-    depth2 = -depth*3
-    depth = depth*2
 
     # Unsharp filter for spatial detail enhancement
     if sharp:
@@ -321,10 +331,7 @@ def PostProcessing(clean: vs.VideoNode, c: vs.VideoNode, defH: int, strength: in
         clean2 = core.std.MaskedMerge(clean2, clsharp if sharp else clean, core.std.Expr([noise_diff, clean.std.Sobel()], 'x y max'))
 
     # Combining result of luma and chroma cleaning
-    output = core.std.ShufflePlanes([clean2, filt], [0, 1, 2], vs.YUV) if c.format.color_family == vs.YUV else clean2
-    if depth:
-        output = core.std.MergeDiff(output, core.std.MakeDiff(output.warp.AWarpSharp2(128, 3, 1, depth2, 1), output.warp.AWarpSharp2(128, 2, 1, depth, 1)))
-    return output
+    return core.std.ShufflePlanes([clean2, filt], [0, 1, 2], vs.YUV) if c.format.color_family == vs.YUV else clean2
 
 
 # mClean denoising method

@@ -98,7 +98,7 @@ For better performance, you can disable m1 for videos with delicate textures and
 You can also simply resize MVTools pass smaller (.5 or .4) which will produce a bit more blur. If m1=1 (no downsize), you can reduce sharp from 11 to 10.
 
 
-+++ Renoise and Sharpen  (rn=14, sharp=11) +++
++++ Renoise and Sharpen  (rn=14, sharp=9.5) +++
 
 The idea comes from mClean by Burfadel (https://forum.doom9.org/showthread.php?t=174804) and the algorithm was changed by someone else while porting 
 to VapourSynth, producing completely different results -- original Avisynth version blurs a lot more, VapourSynth version keeps a lot more details.

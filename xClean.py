@@ -277,11 +277,9 @@ def PostProcessing(clean: vs.VideoNode, c: vs.VideoNode, defH: int, strength: in
         if defH > 1200:
             cleanm = cleanm.std.Maximum()
 
-        # Adjust mask levels while respecting color range of each frame
-        def AdjustLevels(n, f, clip, strength):
-            fullRange = '_ColorRange' in f.props and f.props['_ColorRange'] == 0
-            return clip.std.Levels((0 if fullRange else 16) - strength, 255 if fullRange else 235, 0.85, 0, 255+strength)
-        cleanm = cleanm.std.FrameEval(functools.partial(AdjustLevels, clip=cleanm, strength=strength), prop_src=c)
+        # Adjust mask levels
+        fullRange = GetColorRange(c)
+        cleanm = cleanm.std.Levels((0 if fullRange else 16) - strength, 255 if fullRange else 235, 0.85, 0, 255+strength)
 
         # Merge based on luma mask
         clean = core.std.MaskedMerge(clean, cy, cleanm)
@@ -427,9 +425,10 @@ def SpotLess(c: vs.VideoNode, radt: int = 1, thsad: int = 10000, thsad2: Optiona
 
 # BM3D denoising method
 def BM3D(clip: vs.VideoNode, sigma: float, gpuid: int, chroma: bool, ref: Optional[vs.VideoNode], m: int, block_step: int, bm_range: int, ps_range: int) -> vs.VideoNode:
-    clean = clip.resize.Bicubic(format=vs.RGBS, matrix_in_s="709") if chroma else core.std.ShufflePlanes(clip, [0], vs.GRAY).fmtc.bitdepth(bits=32, dmode=1)
+    matrix = GetMatrix(clip)
+    clean = clip.resize.Bicubic(format=vs.RGBS, matrix_in=matrix) if chroma else core.std.ShufflePlanes(clip, [0], vs.GRAY).fmtc.bitdepth(bits=32, dmode=1)
     if ref:
-        ref = ref.resize.Bicubic(format=vs.RGBS, matrix_in_s="709") if chroma else core.std.ShufflePlanes(ref, [0], vs.GRAY).fmtc.bitdepth(bits=32, dmode=1)
+        ref = ref.resize.Bicubic(format=vs.RGBS, matrix_in=matrix) if chroma else core.std.ShufflePlanes(ref, [0], vs.GRAY).fmtc.bitdepth(bits=32, dmode=1)
     if gpuid >= 0:
         clean = core.bm3dcuda_rtc.BM3D(clean, sigma=sigma, ref=ref, device_id=gpuid, fast=False, block_step=block_step, bm_range=bm_range, ps_range=ps_range)
     else:
@@ -453,22 +452,6 @@ def KnlMeans(clip: vs.VideoNode, d: int, a: int, h: int, gpuid: int, chroma: boo
 
 
 def ConvertToM(c: vs.VideoNode, src: vs.VideoNode, m: int) -> vs.VideoNode:
-    # Convert back while respecting ColorRange, Matrix, ChromaLocation, Transfer and Primaries of each frame. Note that setting range=1 sets _ColorRange=0 (reverse)
-    def ConvertBack(n, f, clip, format):
-        fullRange = "_ColorRange" in f.props and f.props["_ColorRange"] == 0
-        matrix = "_Matrix" in f.props and f.props["_Matrix"]
-        if matrix == 0 or matrix == 2:
-            matrix = 6
-        transfer = "_Transfer" in f.props and f.props["_Transfer"] or 1
-        if transfer == 2:
-            transfer = matrix
-        primaries = "_Primaries" in f.props and f.props["_Primaries"] or 1
-        if primaries == 2:
-            primaries = matrix
-        chroma = "_ChromaLocation" in f.props and f.props["_ChromaLocation"] or 0
-        return clip.resize.Bicubic(format=format, matrix=matrix, chromaloc=chroma, range = 1 if fullRange else 0)
-        # transfer=transfer, primaries=primaries
-
     if src.format.color_family == vs.GRAY:
         fmt = vs.GRAY32 if m == 4 else vs.GRAY16 if m == 3 or m == 2 else vs.GRAY8
     else:
@@ -479,41 +462,42 @@ def ConvertToM(c: vs.VideoNode, src: vs.VideoNode, m: int) -> vs.VideoNode:
     elif c.format.color_family in [vs.YUV, vs.GRAY]:
         return c.resize.Bicubic(format=fmt)
     else:
-        return core.std.BlankClip(src, format=fmt).std.FrameEval(functools.partial(ConvertBack, clip=c, format=fmt), prop_src=src)
+        # Convert back while respecting ColorRange, Matrix, ChromaLocation, Transfer and Primaries. Note that setting range=1 sets _ColorRange=0 (reverse)
+        fullRange = GetColorRange(c)
+        # transfer = GetTransfer(c)
+        # primaries = GetPrimaries(c)
+        return c.resize.Bicubic(format=fmt, matrix=GetMatrix(c), chromaloc=GetChromaLoc(c), range = 1 if fullRange == 0 else 0)
 
 
 # Adjusts brightness and contrast
-def Tweak(c: vs.VideoNode, bright: float = None, cont: float = None) -> vs.VideoNode:
-    def TweakFunc(n, f, clip, bright, cont):
-        fullRange = "_ColorRange" in f.props and f.props["_ColorRange"] == 0
-        bd = clip.format.bits_per_sample
-        isFLOAT = clip.format.sample_type == vs.FLOAT
-        isGRAY = clip.format.color_family == vs.GRAY
-        mid = 0 if isFLOAT else 1 << (bd - 1)
+def Tweak(clip: vs.VideoNode, bright: float = None, cont: float = None) -> vs.VideoNode:
+    fullRange = GetColorRange(clip)
+    bd = clip.format.bits_per_sample
+    isFLOAT = clip.format.sample_type == vs.FLOAT
+    isGRAY = clip.format.color_family == vs.GRAY
+    mid = 0 if isFLOAT else 1 << (bd - 1)
 
-        if clip.format.color_family == vs.RGB:
-            raise TypeError("Tweak: RGB color family is not supported!")
+    if clip.format.color_family == vs.RGB:
+        raise TypeError("Tweak: RGB color family is not supported!")
 
-        if not (bright is None and cont is None):
-            bright = 0.0 if bright is None else bright
-            cont = 1.0 if cont is None else cont
+    if not (bright is None and cont is None):
+        bright = 0.0 if bright is None else bright
+        cont = 1.0 if cont is None else cont
 
-            if isFLOAT:
-                expr = "x {} * {} + 0.0 max 1.0 min".format(cont, bright)
-                clip =  core.std.Expr([clip], [expr] if isGRAY else [expr, ''])
-            else:
-                luma_lut = []
-                luma_min = 16  << (bd - 8) if not fullRange else 0
-                luma_max = 235 << (bd - 8) if not fullRange else (1 << bd) - 1
+        if isFLOAT:
+            expr = "x {} * {} + 0.0 max 1.0 min".format(cont, bright)
+            clip =  core.std.Expr([clip], [expr] if isGRAY else [expr, ''])
+        else:
+            luma_lut = []
+            luma_min = 16  << (bd - 8) if not fullRange else 0
+            luma_max = 235 << (bd - 8) if not fullRange else (1 << bd) - 1
 
-                for i in range(1 << bd):
-                    val = int((i - luma_min) * cont + bright + luma_min + 0.5)
-                    luma_lut.append(min(max(val, luma_min), luma_max))
+            for i in range(1 << bd):
+                val = int((i - luma_min) * cont + bright + luma_min + 0.5)
+                luma_lut.append(min(max(val, luma_min), luma_max))
 
-                clip = core.std.Lut(clip, [0], luma_lut)
-        return clip
-
-    return c.std.FrameEval(functools.partial(TweakFunc, clip=c, bright=bright, cont=cont), prop_src=c)
+            clip = core.std.Lut(clip, [0], luma_lut)
+    return clip
 
 
 # from muvsfunc
@@ -551,3 +535,26 @@ def ClipSampling(clip: vs.VideoNode) -> str:
     return "GRAY" if clip.format.color_family == vs.GRAY else \
             "444" if clip.format.subsampling_w == 0 and clip.format.subsampling_h == 0 else \
             "422" if clip.format.subsampling_w == 1 and clip.format.subsampling_h == 0 else "420"
+
+# Get frame properties
+def GetFrameProp(c: vs.VideoNode, name: str, default):
+    props = c.get_frame(0).props
+    return props[name] if name in props else default
+
+def GetColorRange(c: vs.VideoNode) -> int:
+    return GetFrameProp(c, "_ColorRange", 1)
+
+def GetMatrix(c: vs.VideoNode) -> int:
+    matrix = GetFrameProp(c, "_Matrix", 1)
+    return 6 if matrix in [0, 2] else matrix
+
+def GetTransfer(c: vs.VideoNode) -> int:
+    transfer = GetFrameProp(c, "_Transfer", 0)
+    return GetMatrix(c) if transfer in [0, 2] else transfer
+
+def GetPrimaries(c: vs.VideoNode) -> int:
+    primaries = GetFrameProp(c, "_Primaries", 0)
+    return GetMatrix(c) if primaries in [0, 2] else primaries
+
+def GetChromaLoc(c: vs.VideoNode) -> int:
+    return GetFrameProp(c, "_ChromaLocation", 0)

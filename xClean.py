@@ -112,9 +112,7 @@ The noise is processed and stabilized before re-inserting so that it's less dist
 Renoise also helps reduce large-radius grain; but should be disabled for anime (rn=0).
 
 Using the same analysis data, it's also sharpening to compensate for denoising blur.
-
-Normal sharpening must be between 0 and 20. 21-24 provide 'overboost' sharpening, generally only suitable for high definition, high quality sources.
-Actual sharpening calculation is scaled based on resolution.
+Sharpening must be between 0 and 20. Actual sharpening calculation is scaled based on resolution.
 
 
 +++ Strength / Dynamic Denoiser Strength  (strength=20) +++
@@ -166,8 +164,8 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         raise TypeError("xClean: Only YUV or GRAY clips are supported")
 
     defH = max(clip.height, clip.width // 4 * 3) # Resolution calculation for auto blksize settings
-    if sharp < 0 or sharp > 24:
-        raise ValueError("xClean: sharp must be between 0 and 24")
+    if sharp < 0 or sharp > 20:
+        raise ValueError("xClean: sharp must be between 0 and 20")
     if rn < 0 or rn > 20:
         raise ValueError("xClean: rn (renoise strength) must be between 0 and 20")
     if depth < 0 or depth > 5:
@@ -217,7 +215,7 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
             c1 = c1.fmtc.bitdepth(bits=16, dmode=1)
         # Adjust sharp based on h parameter.
         # m1=1: sharp=9.6,  m1=.5: sharp=10.3, m1=.3: sharp=10.6
-        sharp1 = max(0, min(24, sharp + (1 - m1r) * 1.35))
+        sharp1 = max(0, min(20, sharp + (1 - m1r) * 1.35))
         output = PostProcessing(output, c1, defH, strength, sharp1, rn, rgmode, 0)
         if m1r > 0:
             output = output.resize.Bicubic(c.width, c.height)
@@ -238,7 +236,7 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         output = KnlMeans(c3, d, a, h, gpuid, chroma, ref)
         # Adjust sharp based on h parameter.
         # h=0: sharp=10.3, h=1.4: sharp=10.8, h=2.8: sharp=11.3
-        sharp3 = max(0, min(24, sharp - .5 + (h/2.8)))
+        sharp3 = max(0, min(20, sharp - .5 + (h/2.8)))
         output = PostProcessing(output, c3, defH, strength, sharp3, rn, rgmode, 2)
 
     # Add Depth (thicken lines for anime)
@@ -268,7 +266,6 @@ def PostProcessing(clean: vs.VideoNode, c: vs.VideoNode, defH: int, strength: in
     if rgmode == 0:
         sharp = 0
         rn = 0
-        depth = 0
         rgmode = 0
 
     # Run at least in 16-bit
@@ -315,12 +312,8 @@ def PostProcessing(clean: vs.VideoNode, c: vs.VideoNode, defH: int, strength: in
     if sharp:
         RE = core.rgsf.Repair if bd == 32 else core.rgvs.Repair
         mult = .69 if method == 2 else .14 if method == 1 else 1
-        if sharp > 20:
-            sharp = (((sharp - 16) / 4) - 1) * mult + 1
-            clsharp = core.std.MakeDiff(clean, clean2.tcanny.TCanny(sigma=sharp, mode=-1))
-        else:
-            sharp = min(50, (15 + defH * sharp * 0.0007) * mult)
-            clsharp = core.std.MakeDiff(clean, Sharpen(clean2, amountH=-0.08-0.03*sharp))
+        sharp = min(50, (15 + defH * sharp * 0.0007) * mult)
+        clsharp = core.std.MakeDiff(clean, Sharpen(clean2, amountH=-0.08-0.03*sharp))
         clsharp = core.std.MergeDiff(clean2, RE(clsharp.tmedian.TemporalMedian(), clsharp, 12))
     
     # If selected, combining ReNoise

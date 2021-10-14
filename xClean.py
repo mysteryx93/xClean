@@ -24,6 +24,10 @@ For top quality, you can add d=3, and/or run vcm.Median(maxgrid=9) before xClean
 For better performance, set m1=0 or m2=0
 If only darker areas contain noise, set strength=-50.
 
+For 720p WebCam, optimal settings are: sharp=9.5, m1=.65, h=2.8
+For 288p anime, optimal settings are: sharp=9.5, m1=.7, rn=0, optional depth=1
+For 5K GoPro (with in-camera sharpening at Low), optimal settings are: sharp=7.7, m1=.6 (or .5 for performance), optional strength=-50
+
 
 +++ Description +++
 

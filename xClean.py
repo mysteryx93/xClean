@@ -149,14 +149,15 @@ For anime, set rn=0. Optionally, you can set depth to 1 or 2 to thicken the line
 +++ Advanced Settings +++
 gpuid = 0: The GPU id to use for KNLMeans and BM3D, or -1 to use CPU.
 gpucuda = 0: The GPU id to use for BM3D, or -1 to use CPU.
-d = 2: KNLMeans parameter, can be set to 3 for small quality improvement.
+d = 2: KNLMeans temporal radius, can be set to 3 for small quality improvement.
+h = 1.4: KNLMeans strength, can increase slightly if the output is still too noisy.
 block_step = 5, bm_range = 15, ps_range = 7: BM3D parameters for performance vs quality.
 
 Normally you shouldn't have to touch these
 rgmode = 18: RemoveGrain mode used during post-processing. Setting this to 0 disables post-processing, useful to compare raw denoising.
 thsad = 400: Threshold used for MVTools analysis.
-a = 2, h = 1.4: KNLMeans parameter.
-sigma = 9: BM3D parameter.
+a = 2: KNLMeans spacial radius.
+sigma = 9: BM3D strength.
 """
 
 def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: float = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .6, m2: int = 3, m3: int = 3, outbits: Optional[int] = None,

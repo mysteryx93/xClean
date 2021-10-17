@@ -160,7 +160,7 @@ a = 2: KNLMeans spacial radius.
 sigma = 9: BM3D strength.
 """
 
-def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: float = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .6, m2: int = 3, m3: int = 3, outbits: Optional[int] = None,
+def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: float = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .5, m2: int = 3.7, m3: int = 3, outbits: Optional[int] = None,
         dmode: int = 0, rgmode: int = 18, thsad: int = 400, d: int = 2, a: int = 2, h: float = 1.4, gpuid: int = 0, gpucuda: Optional[int] = None, sigma: float = 9, block_step: int = 5, bm_range: int = 15, ps_range: int = 7, radius: int = 0, bm3d_fast: bool = False) -> vs.VideoNode:
     if not clip.format.color_family in [vs.YUV, vs.GRAY]:
         raise TypeError("xClean: Only YUV or GRAY clips are supported")
@@ -210,13 +210,11 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         m1 = int(m1)
         c1 = c32_444 if m1 == 4 else c16_444 if m1 == 3 else c16 if m1 == 2 else c
         if m1r < 1:
-            c1 = c1.resize.Bicubic((c.width * m1r)//2*2, (c.height * m1r)//2*2)
+            c1 = c1.resize.Bicubic((c.width * m1r)//2*2, (c.height * m1r)//2*2, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.75, filter_param_b_uv=.75)
         output = MvTools(c1, chroma, defH, thsad) if m1 < 4 else SpotLess(c1, chroma=chroma, radt=3)
         if c1.format.bits_per_sample < 16:
             c1 = c1.fmtc.bitdepth(bits=16, fulls=fulls, fulld=fulls, dmode=1)
-        # Adjust sharp based on downscale parameter.
-        sharp1 = max(0, min(20, sharp + (1 - m1r) * 1.35))
-        output = PostProcessing(output, c1, defH, strength, sharp1, rn, rgmode, 0)
+        output = PostProcessing(output, c1, defH, strength, sharp, rn, rgmode, 0)
 
     # Apply BM3D
     if m2 > 0:
@@ -224,25 +222,23 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         m2 = int(m2)
         m2o = max(2, max(m2, m3))
         c2 = c32_444 if m2o==4 else c16_444 if m2o==3 else c16
-        ref = output.resize.Bicubic((c.width * m2r)//2*2, (c.height * m2r)//2*2, format=c2.format) if output else None
+        ref = output.resize.Spline16((c.width * m2r)//2*2, (c.height * m2r)//2*2, format=c2.format) if output else None
         if m2r < 1:
-            c2 = c2.resize.Bicubic((c.width * m2r)//2*2, (c.height * m2r)//2*2)
+            c2 = c2.resize.Spline16((c.width * m2r)//2*2, (c.height * m2r)//2*2)
         output = BM3D(c2, sigma, gpucuda, chroma, ref, m2o, block_step, bm_range, ps_range, radius, bm3d_fast)
-        # Adjust sharp based on downscale parameter.
-        sharp2 = max(0, min(20, sharp + (1 - m2r) * 1.35))
-        output = PostProcessing(output, c2, defH, strength, sharp2, rn, rgmode, 1)
+        output = PostProcessing(output, c2, defH, strength, sharp, rn, rgmode, 1)
 
     # Apply KNLMeans
     if m3 > 0:
         m3 = min(2, m3) # KNL internally computes in 16-bit
-        ref = ConvertToM(output.resize.Bicubic(c.width, c.height), clip, m3) if output else None
+        ref = ConvertToM(output.resize.Spline16(c.width, c.height), clip, m3) if output else None
         c3 = c32_444 if m3==4 else c16_444 if m3==3 else c16
         output = KnlMeans(c3, d, a, h, gpuid, chroma, ref)
         # Adjust sharp based on h parameter.
         sharp3 = max(0, min(20, sharp - .5 + (h/2.8)))
         output = PostProcessing(output, c3, defH, strength, sharp3, rn, rgmode, 2)
     else:
-        output = output.resize.Bicubic(c.width, c.height)
+        output = output.resize.Spline16(c.width, c.height)
 
     # Add Depth (thicken lines for anime)
     if depth:

@@ -211,7 +211,7 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         m1r = 1 if m1 == int(m1) else m1 % 1 # Decimal point is resize factor
         m1 = int(m1)
         c1 = c32_444 if m1 == 4 else c16_444 if m1 == 3 else c16 if m1 == 2 else c
-        c1r = c1.resize.Bicubic((c.width * m1r)//2*2, (c.height * m1r)//2*2, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.75, filter_param_b_uv=.75) if m1r < 1 else c1
+        c1r = c1.resize.Bicubic((c.width * m1r)//4*4, (c.height * m1r)//4*4, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.75, filter_param_b_uv=.75) if m1r < 1 else c1
         output = MvTools(c1r, chroma, defH, thsad)
         sharp1 = max(0, min(20, sharp + (1 - m1r) * .35))
         output = PostProcessing(output, c1r, defH, strength, sharp1, rn, rgmode, 0)
@@ -222,20 +222,20 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         m2 = int(m2)
         m2o = max(2, max(m2, m3))
         c2 = c32_444 if m2o==4 else c16_444 if m2o==3 else c16
-        ref = output.resize.Spline16((c.width * m2r)//2*2, (c.height * m2r)//2*2, format=c2.format) if output else None
-        c2r = c2.resize.Spline16((c.width * m2r)//2*2, (c.height * m2r)//2*2) if m2r < 1 else c2
+        ref = output.resize.Spline36((c.width * m2r)//4*4, (c.height * m2r)//4*4, format=c2.format) if output else None
+        c2r = c2.resize.Bicubic((c.width * m2r)//4*4, (c.height * m2r)//4*4, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.5, filter_param_b_uv=.5) if m2r < 1 else c2
         output = BM3D(c2r, sigma, gpucuda, chroma, ref, m2o, block_step, bm_range, ps_range, radius, bm3d_fast, opp)
-        output = output.resize.Spline16(c.width, c.height) if m2r < 1 else output
+        output = output.resize.Spline36(c.width, c.height) if m2r < 1 else output
         sharp2 = max(0, min(20, sharp + (1 - m2r) * .95))
         output = PostProcessing(output, c2, defH, strength, sharp2, rn, rgmode, 1)
 
     if output.height < c.height:
-        output = output.resize.Spline16(c.width, c.height)
+        output = output.resize.Spline36(c.width, c.height)
 
     # Apply KNLMeans
     if m3 > 0:
         m3 = min(2, m3) # KNL internally computes in 16-bit
-        ref = ConvertToM(output.resize.Spline16(c.width, c.height), clip, m3) if output else None
+        ref = ConvertToM(output, clip, m3) if output else None
         c3 = c32_444 if m3==4 else c16_444 if m3==3 or ClipSampling(ref) == "444" else c16
         output = KnlMeans(c3, d, a, h, gpuid, chroma, ref)
         # Adjust sharp based on h parameter.

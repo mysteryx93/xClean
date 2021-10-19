@@ -6,7 +6,7 @@ from typing import Optional
 
 """
 xClean 3-pass denoiser
-beta 3 (2021-10-13) by Etienne Charland
+beta 4 (2021-10-18) by Etienne Charland
 Supported formats: YUV, GRAY
 Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian, knlm, bm3d, bm3dcuda_rtc, bm3dcpu, neo_f3kdb
 
@@ -15,23 +15,22 @@ xClean runs MVTools -> BM3D -> KNLMeans in that order, passing the output of eac
 The objective is to remove noise while preserving as much details as possible. Removing noise is easy -- just blur out everything.
 The hard work is in preserving the details in a way that feels natural.
 
-I designed it for raw camera footage to remove noise in dark areas while preserving the fine details. It works for most types of content.
+Designed for raw camera footage to remove noise in dark areas while preserving the fine details. It works for most types of content.
 
 +++ Short Doc (TL;DR) +++
-
 Default settings provide the best quality in most cases. Simply use
 xClean(sharp=..., outbits=...)
-For top quality, you can add d=3, and/or run vcm.Median(maxgrid=9) before xClean
-For better performance, set m1=0 or m2=0
-If only darker areas contain noise, set strength=-50.
+
+If only darker areas contain noise, set strength=-50
+For better performance, set m1=0 or m2=0, or set m1=.5 and m2=3.6 (downscale)
+BM3D performance can be greatly improved by setting radius=0, block_step=7, bm_range=7, ps_range=5
 
 For 720p WebCam, optimal settings are: sharp=9.5, m1=.65, h=2.8
 For 288p anime, optimal settings are: sharp=9.5, m1=.7, rn=0, optional depth=1
-For 5K GoPro (with in-camera sharpening at Low), optimal settings are: sharp=7.7, m1=.6 (or .5 for performance), optional strength=-50
+For 4-5K GoPro (with in-camera sharpening at Low), optimal settings are: sharp=7.7, m1=.5, m2=3.7, optional strength=-50 (or m1=.6, m2=3.8 if your computer can handle it)
 
 
 +++ Description +++
-
 KNLMeans does a good job at denoising but can soften the image, lose details and give an artificial plastic look. I found that on any given source
 (tested 5K GoPro footage and noisy WebCam), denoising with less than h=1.4 looks too noisy, and anything above it blurs out the details. 
 KNLMeans also keeps a lot of data from the clip passed as rclip, so doing a good prefilter highly impacts the output.
@@ -42,7 +41,7 @@ xClean is essentially KNLMeans with advanced pre-filtering and with post-process
 
 One strange aspect of xClean is that denoising is automatic and there's very little room to configure denoising strength other than reducing the overall effect.
 It runs with BM3D sigma=9 and KNL h=1.4, and generally you shouldn't change that. One setting that can allow increasing denoising (and performance)
-is downscaling MVTools pass. You can also slightly increase 'h' if the output remains too noisy.
+is downscaling MVTools and BM3D passes. You can also set h=2.8 if the output remains too noisy. h = 1.4 or 2.8 are generally the best values.
 
 According to my tests, water & cliff 5K video with little noise preserves the details very well while removing subtle grain, and with same settings,
 very noisy 720p WebCam footage has HUGE noise reduction while preserving a surprising amount of natural details.
@@ -51,7 +50,6 @@ The default settings are very tolerant to various types of clips.
 
 
 +++ Denoising Methods Overview +++
-
 To provide the best output, processing is done in 3 passes, passing the output of one pass as the ref clip of the 2nd pass. Each denoiser has its strengths and weaknesses.
 
 Pass 1: MVTools (m1)
@@ -61,46 +59,31 @@ Ref: Impacts vectors analysis but low impact on outcome
 
 Pass 2: BM3D (m2)
 Strength: Good at preserving fine details!
-Weakness: Doesn't remove much grain. Poor temporal stability.
+Weakness: Doesn't remove much grain.
 Ref: Moderate impact on outcome. A blurry ref will remove more grain while BM3D puts back a lot of details.
-radius=1 provides nearly no benefit at huge performance cost since MVTools already does temporal analysis
 
 Pass 3: KNLMeansCL (m3)
 Strength: Best general-purpose denoiser
 Weakness: Can blur out details and give an artificial plastic effect
-Ref: Highly impacts the outcome. All prefilters benefit from running KNLMeans over it.
-
-MVTools + BM3D (m1+m2)
-Strength: Keeps a lot of details with good denoising of fine details as well as larger grain. Single frames can look great.
-Weakness: Single frames look fine but video noise looks unstable in motion.
-
-MVTools + KNLMeans (m1+m3)
-Strength: KNLMeans with extra denoising. Works best in most circumstances.
-Weakness: Delicate textures like water or fog will suffer.
-
-MVTools + BM3D + KNLMeans (m1+m2+m3)
-Strength: Like MvTools+KNLMeans but preserves details with delicate textures. Works best for any kind of content tested.
-Weakness: Performance and memory usage.
+Ref: High impact the outcome. All prefilters benefit from running KNLMeans over it.
 
 
 +++ Denoising Pass Configuration  (m1=.6, m2=3, m3=3) +++
-
 Each pass (method) can be configured with m1 (MVTools), m2 (BM3D) and m3 (KNLMeansCL) parameters to run at desired bitdepth.
 This means you can fine-tune for quality vs performance.
 
 0 = Disabled, 1 = 8-bit, 2 = 16-bit, 3 = 16-bit YUV444, 4 = 32-bit YUV444
 
 Note: BM3D always processes in 32-bit, KNLMeansCL always processes in 16-bit+, and post-processing always processes at least in 16-bit, so certain
-values such as m2=1, m3=1 will behave the same as m2=2, m3=2. Setting m2=3 will only affect BM3D post-processing (YUV444P16 instead of YUV420P16)
+values such as m2=1, m3=1 will behave the same as m2=2, m3=2. Setting m2=2 instead of 3 will only affect BM3D post-processing (YUV420P16 instead of YUV444P16)
 
-MVTools pass (m1) can also be downscaled for performance gain, and it can even improve quality! Values between .5 and .8 generally work best.
-Resizing by a factor of .6 provides the best quality in my tests, and .5 works best if you want that extra performance.
+MVTools (m1) and BM3D (m2) passes can also be downscaled for performance gain, and it can even improve quality! Values between .5 and .8 generally work best.
 
 Optional resize factor is set after the dot:
-m1 = .6 or 1.6 processes in 8-bit at 60% of the size. m1 = 2.6 processes in 16-bit at 60% of the size.
-
-For better performance, you can disable m1 for videos with delicate textures and low noise, or disable m2 for videos with no delicate textures.
-You can also simply resize MVTools pass smaller (.5 or .4) which will produce a bit more blur. If m1=1 (no downsize), you can reduce sharp from 11 to 10.
+m1 = .6 or 1.6 processes MVTools in 8-bit at 60% of the size. m2 = 3.6 processes BM3D in 16-bit at 60% of the size.
+You may want to downscale MVTools (m1) because of high CPU usage and low impact on outcome.
+You may want to downscale BM3D (m2) because of high memory usage. If you run out of memory, lower the size until you get no hard-drive paging.
+Note: Setting radius=0 greatly reduces BM3D memory usage!
 
 
 +++ Renoise and Sharpen  (rn=14, sharp=9.5) +++
@@ -117,14 +100,17 @@ Sharpening must be between 0 and 20. Actual sharpening calculation is scaled bas
 
 
 +++ Strength / Dynamic Denoiser Strength  (strength=20) +++
-
 A value of 20 will denoise normally.
 A value between 1 and 19 will reduce the denoising effect by partially merging back with the original clip.
-
 A value between 0 and -200 will activate Dynamic Denoiser Strength, useful when bright colors require little or no denoising and dark colors contain more noise.
 It applies a gradual mask based on luma. Specifying a value of -50 means that out of 255 (or 219 tv range), the 50 blackest values have full-reduction 
 and the 50 whitest values are merged at a minimal strength of 50/255 = 20%.
 
++++ Radius  (radius=0) +++
+BM3D radius. Low impact on individual frames.
+Pros: Helps stabilize temporal grain. Can significantly improve video compressability.
+Cons: High impact on performance and memory usage! May require downscaling BM3D for HD content with m2 between 3.6 and 3.8
+For moving water, the temporal stabilization may be undesirable.
 
 +++ Depth  (depth=0) +++
 This applies a modified warp sharpening on the image that may be useful for certain things, and can improve the perception of image depth.
@@ -132,12 +118,11 @@ Settings range up from 0 to 5. This function will distort the image, for animati
 
 +++ Deband  (deband=False) +++
 This will perceptibly improve the quality of the image by reducing banding effect and adding a small amount of temporally stabilised grain
-to both luma and chroma. The settings are not adjustable as the default settings are suitable for most cases without having a large effect
-on compressibility. 0 = disabled, 1 = deband
+to both luma and chroma. Default settings are suitable for most cases without having a large effect on compressibility.
 
 +++ Output  (outbits, dmode=0) +++
 Specifies the output bitdepth. If not specified it will be converted back to the bitdepth of the source clip using dithering method specified by dmode.
-You can set dmode=3 if you won't be doing any further processing.
+You can set dmode=3 if you won't be doing any further processing for high-quality ditherig.
 
 +++ Chroma  (chroma=False) +++
 True to process both Luma and Chroma planes, False to process only Luma.
@@ -148,21 +133,23 @@ For anime, set rn=0. Optionally, you can set depth to 1 or 2 to thicken the line
 +++ Advanced Settings +++
 gpuid = 0: The GPU id to use for KNLMeans and BM3D, or -1 to use CPU.
 gpucuda = 0: The GPU id to use for BM3D, or -1 to use CPU.
-d = 2: KNLMeans temporal radius, can be set to 3 for small quality improvement.
-h = 1.4: KNLMeans strength, can increase slightly if the output is still too noisy.
-block_step = 4, bm_range = 16, ps_range = 8: BM3D parameters for performance vs quality.
-radius = 0, bm3d_fast = False: BM3D parameters, can set radius=1 or bm3d_fast=True if you got plenty of RAM.
+h = 1.4: KNLMeans strength, can increase slightly if the output is still too noisy. 1.4 or 2.8 generally work best.
+block_step = 4, bm_range = 16, ps_range = 8: BM3D parameters for performance vs quality. No impact on CPU and memory. Adjust based on GPU capability.
+Fast settings are block_step = 5, bm_range = 7, ps_range = 5
 
 Normally you shouldn't have to touch these
 rgmode = 18: RemoveGrain mode used during post-processing. Setting this to 0 disables post-processing, useful to compare raw denoising.
 thsad = 400: Threshold used for MVTools analysis.
+d = 2: KNLMeans temporal radius. Setting 3 can either slightly improve quality or give a slight plastic effect.
 a = 2: KNLMeans spacial radius.
 sigma = 9: BM3D strength.
+bm3d_fast = False. BM3D fast.
+opp = True. Whether to convert to OPP format for BM3D.
 """
 
-def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: float = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .5, m2: int = 3.7, m3: int = 3, outbits: Optional[int] = None,
+def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: float = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .6, m2: int = 3, m3: int = 3, outbits: Optional[int] = None,
         dmode: int = 0, rgmode: int = 18, thsad: int = 400, d: int = 2, a: int = 2, h: float = 1.4, gpuid: int = 0, gpucuda: Optional[int] = None, sigma: float = 9, 
-        block_step: int = 4, bm_range: int = 16, ps_range: int = 8, radius: int = 1, bm3d_fast: bool = False, opp: bool = True) -> vs.VideoNode:
+        block_step: int = 4, bm_range: int = 16, ps_range: int = 8, radius: int = 0, bm3d_fast: bool = False, opp: bool = True) -> vs.VideoNode:
 
     if not clip.format.color_family in [vs.YUV, vs.GRAY]:
         raise TypeError("xClean: Only YUV or GRAY clips are supported")
@@ -527,3 +514,13 @@ def GetPrimaries(c: vs.VideoNode) -> int:
 
 def GetChromaLoc(c: vs.VideoNode) -> int:
     return GetFrameProp(c, "_ChromaLocation", 0)
+
+def YUV2OPP(clip: vs.VideoNode, sample: int = 1):
+    clip = clip.resize.Bicubic(format = vs.RGBS if clip.format.bits_per_sample < 32 else vs.RGBS, matrix_in=GetMatrix(clip))
+    clip = clip.fmtc.matrix(fulls=True, fulld=True, coef=[1/3,1/3,1/3,0, 1/2,0,-1/2,0, 1/4,-1/2,1/4,0], csp = vs.YUV444PS if sample > 0 else vs.YUV444P16)
+    return clip.std.SetFrameProp(prop='_Matrix', intval=2)
+
+def OPP2YUV(clip: vs.VideoNode, src: vs.VideoNode, format: Optional[int] = None):
+    format = format if format != None else src.format
+    clip = core.fmtc.matrix(clip, fulls=True, fulld=True, coef=[1,1,2/3,0, 1,0,-4/3,0, 1,-1,2/3,0], csp = vs.RGBS if format == vs.YUV444PS else vs.RGB48)
+    return clip.resize.Bicubic(format=format, matrix=GetMatrix(clip), chromaloc=GetChromaLoc(src), range=1 if GetColorRange(src) == 0 else 0)

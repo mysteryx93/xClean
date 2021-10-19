@@ -17,6 +17,9 @@ The hard work is in preserving the details in a way that feels natural.
 
 Designed for raw camera footage to remove noise in dark areas while preserving the fine details. It works for most types of content.
 
+Performance-wise, BM3D pass is the heaviest and helps recover fine details, but this script runs 1 pass of BM3D whereas stand-alone BM3D runs twice.
+
+
 +++ Short Doc (TL;DR) +++
 Default settings provide the best quality in most cases. Simply use
 xClean(sharp=..., outbits=...)

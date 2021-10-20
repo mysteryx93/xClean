@@ -1,5 +1,4 @@
 from vapoursynth import core
-import functools
 import vapoursynth as vs
 import math
 from typing import Optional
@@ -90,7 +89,6 @@ Note: Setting radius=0 greatly reduces BM3D memory usage!
 
 
 +++ Renoise and Sharpen  (rn=14, sharp=9.5) +++
-
 The idea comes from mClean by Burfadel (https://forum.doom9.org/showthread.php?t=174804) and the algorithm was changed by someone else while porting 
 to VapourSynth, producing completely different results -- original Avisynth version blurs a lot more, VapourSynth version keeps a lot more details.
 
@@ -175,6 +173,10 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
     if m1 == 0 and m2 == 0 and m3 == 0:
         raise ValueError("xClean: At least one pass must be enabled")
 
+    uv = clip
+    if not chroma:
+        clip = core.std.ShufflePlanes(clip, 0, vs.GRAY)
+
     gpucuda = gpucuda if gpucuda != None else gpuid
     bd = clip.format.bits_per_sample
     fulls = GetColorRange(clip) == 0
@@ -202,7 +204,7 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         m1 = int(m1)
         c1 = c32_444 if m1 == 4 else c16_444 if m1 == 3 else c16 if m1 == 2 else c
         c1r = c1.resize.Bicubic((c.width * m1r)//4*4, (c.height * m1r)//4*4, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.75, filter_param_b_uv=.75) if m1r < 1 else c1
-        output = MvTools(c1r, chroma, defH, thsad)
+        output = MvTools(c1r, defH, thsad)
         sharp1 = max(0, min(20, sharp + (1 - m1r) * .35))
         output = PostProcessing(output, c1r, defH, strength, sharp1, rn, rgmode, 0)
 
@@ -214,7 +216,7 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         c2 = c32_444 if m2o==4 else c16_444 if m2o==3 else c16
         ref = output.resize.Spline36((c.width * m2r)//4*4, (c.height * m2r)//4*4, format=c2.format) if output else None
         c2r = c2.resize.Bicubic((c.width * m2r)//4*4, (c.height * m2r)//4*4, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.5, filter_param_b_uv=.5) if m2r < 1 else c2
-        output = BM3D(c2r, sigma, gpucuda, chroma, ref, m2o, block_step, bm_range, ps_range, radius, bm3d_fast, opp)
+        output = BM3D(c2r, sigma, gpucuda, ref, m2o, block_step, bm_range, ps_range, radius, bm3d_fast, opp)
         output = output.resize.Spline36(c.width, c.height) if m2r < 1 else output
         sharp2 = max(0, min(20, sharp + (1 - m2r) * .95))
         output = PostProcessing(output, c2, defH, strength, sharp2, rn, rgmode, 1)
@@ -227,7 +229,7 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         m3 = min(2, m3) # KNL internally computes in 16-bit
         ref = ConvertToM(output, clip, m3) if output else None
         c3 = c32_444 if m3==4 else c16_444 if m3==3 or ClipSampling(ref) == "444" else c16
-        output = KnlMeans(c3, d, a, h, gpuid, chroma, ref)
+        output = KnlMeans(c3, d, a, h, gpuid, ref)
         # Adjust sharp based on h parameter.
         sharp3 = max(0, min(20, sharp - .5 + (h/2.8)))
         output = PostProcessing(output, c3, defH, strength, sharp3, rn, rgmode, 2)
@@ -250,6 +252,12 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         output = output.fmtc.resample(kernel="bicubic", css=samp, fulls=fulls, fulld=fulls)
     if output.format.bits_per_sample != outbits:
         output = output.fmtc.bitdepth(bits=outbits, fulls=fulls, fulld=fulls, dmode=dmode)
+    
+    # Merge source chroma planes if not processing chroma.
+    if not chroma and uv.format.color_family == vs.YUV:
+        if uv.format.bits_per_sample != outbits:
+            uv = uv.fmtc.bitdepth(bits=outbits, fulls=fulls, fulld=fulls, dmode=0)
+        output = core.std.ShufflePlanes([output, uv], [0, 1, 2], vs.YUV)
     
     return output
 
@@ -325,11 +333,10 @@ def PostProcessing(clean: vs.VideoNode, c: vs.VideoNode, defH: int, strength: in
 
 
 # mClean denoising method
-def MvTools(c: vs.VideoNode, chroma: bool, defH: int, thSAD: int) -> vs.VideoNode:
+def MvTools(c: vs.VideoNode, defH: int, thSAD: int) -> vs.VideoNode:
     bd = c.format.bits_per_sample
     fulls = GetColorRange(c) == 0
     icalc = bd < 32
-    cy = core.std.ShufflePlanes(c, [0], vs.GRAY)
     S = core.mv.Super if icalc else core.mvsf.Super
     A = core.mv.Analyse if icalc else core.mvsf.Analyse
     R = core.mv.Recalculate if icalc else core.mvsf.Recalculate
@@ -342,8 +349,8 @@ def MvTools(c: vs.VideoNode, chroma: bool, defH: int, thSAD: int) -> vs.VideoNod
     truemotion = False if defH > 720 else True
 
     ref = c.std.Convolution(matrix=[2, 3, 2, 3, 6, 3, 2, 3, 2])
-    super1 = S(ref if chroma else core.std.ShufflePlanes(ref, [0], vs.GRAY), hpad=bs, vpad=bs, pel=pel, rfilter=4, sharp=1)
-    super2 = S(c if chroma else cy, hpad=bs, vpad=bs, pel=pel, rfilter=1, levels=1)
+    super1 = S(ref, hpad=bs, vpad=bs, pel=pel, rfilter=4, sharp=1)
+    super2 = S(c, hpad=bs, vpad=bs, pel=pel, rfilter=1, levels=1)
     analyse_args = { 'blksize': bs, 'overlap': ov, 'search': 5, 'truemotion': truemotion }
     recalculate_args = { 'blksize': bs, 'overlap': ov, 'search': 5, 'truemotion': truemotion, 'thsad': 180, 'lambda': lampa }
 
@@ -359,45 +366,42 @@ def MvTools(c: vs.VideoNode, chroma: bool, defH: int, thSAD: int) -> vs.VideoNod
 
     # Applying cleaning
     if icalc:
-        clean = core.mv.Degrain3(c if chroma else cy, super2, bvec1, fvec1, bvec2, fvec2, bvec3, fvec3, thsad=thSAD)
+        clean = core.mv.Degrain3(c, super2, bvec1, fvec1, bvec2, fvec2, bvec3, fvec3, thsad=thSAD)
     else:
-        clean = core.mvsf.Degrain4(c if chroma else cy, super2, bvec1, fvec1, bvec2, fvec2, bvec3, fvec3, bvec4, fvec4, thsad=thSAD)
+        clean = core.mvsf.Degrain4(c, super2, bvec1, fvec1, bvec2, fvec2, bvec3, fvec3, bvec4, fvec4, thsad=thSAD)
 
     if bd < 16:
         clean = clean.fmtc.bitdepth(bits=16, fulls=fulls, fulld=fulls, dmode=1)
         c = c.fmtc.bitdepth(bits=16, fulls=fulls, fulld=fulls, dmode=1)
 
     if c.format.color_family == vs.YUV:
-        uv = core.std.MergeDiff(clean, core.tmedian.TemporalMedian(core.std.MakeDiff(c, clean, [1, 2]), 1, [1, 2]), [1, 2]) if chroma else c
+        uv = core.std.MergeDiff(clean, core.tmedian.TemporalMedian(core.std.MakeDiff(c, clean, [1, 2]), 1, [1, 2]), [1, 2])
         clean = core.std.ShufflePlanes(clips=[clean, uv], planes=[0, 1, 2], colorfamily=vs.YUV)
     return clean
 
 
 # BM3D denoising method
-def BM3D(clip: vs.VideoNode, sigma: float, gpuid: int, chroma: bool, ref: Optional[vs.VideoNode], m: int, block_step: int, bm_range: int, ps_range: int, radius: int, bm3d_fast: bool, opp: bool = False) -> vs.VideoNode:
+def BM3D(clip: vs.VideoNode, sigma: float, gpuid: int, ref: Optional[vs.VideoNode], m: int, block_step: int, bm_range: int, ps_range: int, radius: int, bm3d_fast: bool, opp: bool = False) -> vs.VideoNode:
     matrix = GetMatrix(clip)
-    fulls = GetColorRange(clip) == 0
-    icalc = True
-    fmt = vs.YUV444PS if not opp else vs.RGB48 if icalc else vs.RGBS
-    clean = clip.resize.Bicubic(format=fmt, matrix_in=matrix) if chroma else core.std.ShufflePlanes(clip, [0], vs.GRAY).fmtc.bitdepth(bits=32, fulls=fulls, fulld=fulls, dmode=1)
-    clean = clean.bm3d.RGB2OPP(sample=1) if opp else clean
+    chroma = clip.format.color_family==vs.YUV
+    icalc = clip.format.bits_per_sample < 32
+    fmt = vs.GRAYS if not chroma else vs.YUV444PS if not opp else vs.RGB48 if icalc else vs.RGBS
+    clean = clip.resize.Bicubic(format=fmt, matrix_in=matrix)
+    clean = clean.bm3d.RGB2OPP(sample=1) if opp and chroma else clean
     if ref:
-        ref = ref.resize.Bicubic(format=fmt, matrix_in=matrix) if chroma else core.std.ShufflePlanes(ref, [0], vs.GRAY).fmtc.bitdepth(bits=32, fulls=fulls, fulld=fulls, dmode=1)
-        ref = ref.bm3d.RGB2OPP(sample=1) if opp else ref
+        ref = ref.resize.Bicubic(format=fmt, matrix_in=matrix)
+        ref = ref.bm3d.RGB2OPP(sample=1) if opp and chroma else ref
     if gpuid >= 0:
         clean = core.bm3dcuda_rtc.BM3D(clean, ref, chroma=chroma, sigma=sigma, device_id=gpuid, fast=bm3d_fast, radius=radius, block_step=block_step, bm_range=bm_range, ps_range=ps_range)
     else:
-        #clean = mvf.BM3D(clean, ref=ref, sigma=sigma, radius1=0, profile1="fast", output=1, psample=0, matrix=100)
-        #basic = core.bm3d.VBasic(clean, sigma=sigma, radius=radius, matrix=100).bm3d.VAggregate(radius=radius)
-        #clean = core.bm3d.VFinal(ref, basic, sigma=sigma, radius=radius, matrix=100).bm3d.VAggregate(radius=radius)
-        clean = core.bm3dcpu.BM3D(clean, chroma=chroma, sigma=sigma, ref=ref, block_step=block_step, bm_range=bm_range, ps_range=ps_range, radius=radius)
+        clean = core.bm3dcpu.BM3D(clean, ref, chroma=chroma, sigma=sigma, block_step=block_step, bm_range=bm_range, ps_range=ps_range, radius=radius)
     clean = clean.bm3d.VAggregate(sample=0 if icalc else 1) if radius > 0 else clean
-    clean = clean.bm3d.OPP2RGB(sample=0 if icalc else 1) if opp else clean
+    clean = clean.bm3d.OPP2RGB(sample=0 if icalc else 1) if opp and chroma else clean
     return ConvertToM(clean, clip, m)
 
 
 # KnlMeansCL denoising method, useful for dark noisy scenes
-def KnlMeans(clip: vs.VideoNode, d: int, a: int, h: float, gpuid: int, chroma: bool, ref: Optional[vs.VideoNode]) -> vs.VideoNode:
+def KnlMeans(clip: vs.VideoNode, d: int, a: int, h: float, gpuid: int, ref: Optional[vs.VideoNode]) -> vs.VideoNode:
     if ref and ref.format != clip.format:
         ref = ref.resize.Bicubic(format=clip.format)
     device = dict(device_type="auto" if gpuid >= 0 else "cpu", device_id=max(0, gpuid))
@@ -407,7 +411,7 @@ def KnlMeans(clip: vs.VideoNode, d: int, a: int, h: float, gpuid: int, chroma: b
         return clip.knlm.KNLMeansCL(d=d, a=a, h=h, channels="YUV", rclip=ref, **device)
     else:
         clean = clip.knlm.KNLMeansCL(d=d, a=a, h=h, channels="Y", rclip=ref, **device)
-        uv = clip.knlm.KNLMeansCL(d=d, a=a, h=h/2, channels="UV", rclip=ref, **device) if chroma else clean
+        uv = clip.knlm.KNLMeansCL(d=d, a=a, h=h/2, channels="UV", rclip=ref, **device)
         return core.std.ShufflePlanes(clips=[clean, uv], planes=[0, 1, 2], colorfamily=vs.YUV)
 
 
@@ -521,9 +525,10 @@ def GetChromaLoc(c: vs.VideoNode) -> int:
 def YUV2OPP(clip: vs.VideoNode, sample: int = 1):
     clip = clip.resize.Bicubic(format = vs.RGBS if clip.format.bits_per_sample < 32 else vs.RGBS, matrix_in=GetMatrix(clip))
     clip = clip.fmtc.matrix(fulls=True, fulld=True, coef=[1/3,1/3,1/3,0, 1/2,0,-1/2,0, 1/4,-1/2,1/4,0], csp = vs.YUV444PS if sample > 0 else vs.YUV444P16)
-    return clip.std.SetFrameProp(prop='_Matrix', intval=2)
+    return clip.std.SetFrameProp(prop='_Matrix', intval=2) #.fmtc.bitdepth(bits=32, dmode=1, fulls=True, fulld=True)
 
 def OPP2YUV(clip: vs.VideoNode, src: vs.VideoNode, format: Optional[int] = None):
+    #clip = clip.fmtc.bitdepth(bits=16, dmode=1, fulls=True, fulld=True)
     format = format if format != None else src.format
-    clip = core.fmtc.matrix(clip, fulls=True, fulld=True, coef=[1,1,2/3,0, 1,0,-4/3,0, 1,-1,2/3,0], csp = vs.RGBS if format == vs.YUV444PS else vs.RGB48)
-    return clip.resize.Bicubic(format=format, matrix=GetMatrix(clip), chromaloc=GetChromaLoc(src), range=1 if GetColorRange(src) == 0 else 0)
+    clip = clip.fmtc.matrix(fulls=True, fulld=True, coef=[1,1,2/3,0, 1,0,-4/3,0, 1,-1,2/3,0], csp = vs.RGBS) # if format == vs.YUV444PS else vs.RGB48)
+    return clip.resize.Bicubic(format=format, matrix=GetMatrix(clip), chromaloc=GetChromaLoc(src), range=1) #if GetColorRange(src) == 0 else 0

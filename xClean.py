@@ -5,7 +5,7 @@ from typing import Optional
 
 """
 xClean 3-pass denoiser
-beta 4 (2021-10-18) by Etienne Charland
+beta 5 (2021-10-20) by Etienne Charland
 Supported formats: YUV, GRAY
 Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian, knlm, bm3d, bm3dcuda_rtc, bm3dcpu, neo_f3kdb
 
@@ -522,13 +522,13 @@ def GetPrimaries(c: vs.VideoNode) -> int:
 def GetChromaLoc(c: vs.VideoNode) -> int:
     return GetFrameProp(c, "_ChromaLocation", 0)
 
-def YUV2OPP(clip: vs.VideoNode, sample: int = 1):
-    clip = clip.resize.Bicubic(format = vs.RGBS if clip.format.bits_per_sample < 32 else vs.RGBS, matrix_in=GetMatrix(clip))
-    clip = clip.fmtc.matrix(fulls=True, fulld=True, coef=[1/3,1/3,1/3,0, 1/2,0,-1/2,0, 1/4,-1/2,1/4,0], csp = vs.YUV444PS if sample > 0 else vs.YUV444P16)
-    return clip.std.SetFrameProp(prop='_Matrix', intval=2) #.fmtc.bitdepth(bits=32, dmode=1, fulls=True, fulld=True)
+# def YUV2OPP(clip: vs.VideoNode, sample: int = 1):
+#     clip = clip.resize.Bicubic(format = vs.RGBS if clip.format.bits_per_sample < 32 else vs.RGBS, matrix_in=GetMatrix(clip))
+#     clip = clip.fmtc.matrix(fulls=True, fulld=True, coef=[1/3,1/3,1/3,0, 1/2,0,-1/2,0, 1/4,-1/2,1/4,0], csp = vs.YUV444PS if sample > 0 else vs.YUV444P16)
+#     return clip.std.SetFrameProp(prop='_Matrix', intval=2) #.fmtc.bitdepth(bits=32, dmode=1, fulls=True, fulld=True)
 
-def OPP2YUV(clip: vs.VideoNode, src: vs.VideoNode, format: Optional[int] = None):
-    #clip = clip.fmtc.bitdepth(bits=16, dmode=1, fulls=True, fulld=True)
-    format = format if format != None else src.format
-    clip = clip.fmtc.matrix(fulls=True, fulld=True, coef=[1,1,2/3,0, 1,0,-4/3,0, 1,-1,2/3,0], csp = vs.RGBS) # if format == vs.YUV444PS else vs.RGB48)
-    return clip.resize.Bicubic(format=format, matrix=GetMatrix(clip), chromaloc=GetChromaLoc(src), range=1) #if GetColorRange(src) == 0 else 0
+# def OPP2YUV(clip: vs.VideoNode, src: vs.VideoNode, format: Optional[int] = None):
+#     #clip = clip.fmtc.bitdepth(bits=16, dmode=1, fulls=True, fulld=True)
+#     format = format if format != None else src.format
+#     clip = clip.fmtc.matrix(fulls=True, fulld=True, coef=[1,1,2/3,0, 1,0,-4/3,0, 1,-1,2/3,0], csp = vs.RGBS) # if format == vs.YUV444PS else vs.RGB48)
+#     return clip.resize.Bicubic(format=format, matrix=GetMatrix(clip), chromaloc=GetChromaLoc(src), range=1) #if GetColorRange(src) == 0 else 0

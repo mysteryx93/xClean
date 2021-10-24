@@ -1,13 +1,13 @@
-from vapoursynth import core
+from vapoursynth import RGB, ColorFamily, core
 import vapoursynth as vs
 import math
 from typing import Optional
-import nnedi3_resample as nnedi3r
+import nnedi3_resample as nnedi3
 
 """
 xClean 3-pass denoiser
 beta 6 (2021-10-24) by Etienne Charland
-Supported formats: YUV, GRAY
+Supported formats: YUV, RGB, GRAY
 Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian, knlm, bm3d, bm3dcuda_rtc, bm3dcpu, neo_f3kdb, akarin, nnedi3_resample, nnedi3cl
 
 xClean runs MVTools -> BM3D -> KNLMeans in that order, passing the output of each pass as the ref of the next denoiser.
@@ -161,8 +161,8 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         dmode: int = 0, rgmode: int = 18, thsad: int = 400, d: int = 2, a: int = 2, h: float = 1.4, gpuid: int = 0, gpucuda: Optional[int] = None, sigma: float = 9, 
         block_step: int = 4, bm_range: int = 16, ps_range: int = 8, radius: int = 0, bm3d_fast: bool = False, conv: bool = True, downchroma: bool = None) -> vs.VideoNode:
 
-    if not clip.format.color_family in [vs.YUV, vs.GRAY]:
-        raise TypeError("xClean: Only YUV or GRAY clips are supported")
+    # if not clip.format.color_family in [vs.YUV, vs.GRAY]:
+    #     raise TypeError("xClean: Only YUV or GRAY clips are supported")
 
     width = clip.width
     height = clip.height
@@ -195,7 +195,7 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
     if isGray:
         chroma = "none"
         conv = False
-    dochroma = chroma != "none"
+    dochroma = chroma != "none" or samp == "RGB"
     downchroma = downchroma or False if chroma == "reconstructor" else True
 
     gpucuda = gpucuda if gpucuda != None else gpuid
@@ -206,9 +206,9 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         raise ValueError("xClean: outbits must be 8, 10, 12, 14, 16 or 32")
     
     # Reference clips are in RGB or GRAY format, to allow converting to desired formats
-    cchroma = clip if samp == "444" else \
+    cchroma = clip if samp in ["444", "RGB"] else \
         ChromaReconstructor(clip, gpuid) if chroma == "reconstructor" else \
-        nnedi3r.nnedi3_resample(clip, fulls=fulls, fulld=fulls, csp=vs.YUV444P16) if chroma == "nnedi3" else \
+        nnedi3.nnedi3_resample(clip, fulls=fulls, fulld=fulls, csp=vs.YUV444P16, mode="nnedi3cl" if gpuid >= 0 else "znedi3", device=max(0, gpuid)) if chroma == "nnedi3" else \
         core.resize.Bicubic(clip, format=vs.YUV444P16, filter_param_a_uv=0, filter_param_b_uv=.5)
     c16 = cchroma.resize.Bicubic(format=vs.RGB48 if conv else vs.YUV444P16, matrix_in=GetMatrix(clip)) if not isGray else ConvertBits(clip, 16, fulls, True)
     c32 = ConvertBits(c16, 32, fulls, False)
@@ -278,7 +278,7 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
 
     # Convert to desired output format and bitrate
     output = YCgCoR_to_RGB(output, fulls) if conv else output
-    fmt = GetFormat(samp if downchroma else "444", output.format.bits_per_sample)
+    fmt = GetFormat(samp if samp=="RGB" or downchroma else "444", output.format.bits_per_sample)
     output = output.resize.Bicubic(format=fmt, matrix=GetMatrix(clip), chromaloc=GetChromaLoc(clip), range=1 if fulls else 0, filter_param_a_uv=0, filter_param_b_uv=.5)
     if output.format.bits_per_sample != outbits:
         output = output.fmtc.bitdepth(bits=outbits, fulls=fulls, fulld=fulls, dmode=dmode)
@@ -550,9 +550,11 @@ def GetFrameProp(c: vs.VideoNode, name: str, default):
     return props[name] if name in props else default
 
 def GetColorRange(c: vs.VideoNode) -> int:
-    return GetFrameProp(c, "_ColorRange", 1)
+    return 0 if c.format.color_family == vs.RGB else GetFrameProp(c, "_ColorRange", 1)
 
 def GetMatrix(c: vs.VideoNode) -> int:
+    if c.format.color_family == vs.RGB:
+        return 0
     matrix = GetFrameProp(c, "_Matrix", 1)
     return 6 if matrix in [0, 2] else matrix
 
@@ -696,124 +698,23 @@ def ex_dlut(expr: str = "", bits: int = 8, fulls: bool = False) -> str:
 
 # feisty2's ChromaReconstructor_faster v3.0 HBD mod
 def ChromaReconstructor(clip: vs.VideoNode, gpuid: int = 0):
+    fulls = GetColorRange(clip) == 0
     w = clip.width
     h = clip.height
     Y = core.std.ShufflePlanes(clip, [0], vs.GRAY)
     Uor = core.std.ShufflePlanes(clip, [1], vs.GRAY)
     Vor = core.std.ShufflePlanes(clip, [2], vs.GRAY)
     device = dict(device_type="auto" if gpuid >= 0 else "cpu", device_id=max(0, gpuid))
+    nparams = dict(nns=1, qual=1, etype=1, nsize=0, fulls=fulls, fulld=fulls, \
+        target_width=w*2, target_height=h*2, kernel="Bicubic", a1=0.0, a2=0.75, \
+        mode="nnedi3cl" if gpuid >= 0 else "znedi3", device=max(0, gpuid))
 
     ref     = Y.knlm.KNLMeansCL(0, 16, 0, pow(1.464968620512209618455732713658, 6.4), wref=1, **device)
-    Luma    = nnedi3_rpow2(ref, rfactor=2, nns=1, qual=1, etype=1, nsize=0)
-    Uu      = nnedi3_rpow2(Uor, rfactor=2, nns=1, qual=1, etype=1, nsize=0, width=w*2, height=h*2, kernel="Bicubic") #, ep0=0.0, ep1=0.75, cshift="bicubicresize")
-    Vu      = nnedi3_rpow2(Vor, rfactor=2, nns=1, qual=1, etype=1, nsize=0, width=w*2, height=h*2) #, ep0=0.0, ep1=0.75, cshift="bicubicresize")
+    Luma    = nnedi3.nnedi3_resample(ref, **nparams)
+    Uu      = nnedi3.nnedi3_resample(Uor, **nparams)
+    Vu      = nnedi3.nnedi3_resample(Vor, **nparams)
     Unew    = Uu.knlm.KNLMeansCL(0, 16, 0, 6.4, wref=0, rclip=Luma, **device).resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)
     Vnew    = Vu.knlm.KNLMeansCL(0, 16, 0, 6.4, wref=0, rclip=Luma, **device).resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)
     U       = core.std.MergeDiff(Unew, core.std.MakeDiff(Unew.std.Convolution(matrix=[1, 1, 1, 1, 0, 1, 1, 1, 1]), Uu.resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)))
     V       = core.std.MergeDiff(Vnew, core.std.MakeDiff(Vnew.std.Convolution(matrix=[1, 1, 1, 1, 0, 1, 1, 1, 1]), Vu.resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)))
     return core.std.ShufflePlanes([Y, U, V], [0, 0, 0], vs.YUV)
-
-
-def nnedi3_rpow2(clip, rfactor=2, width=None, height=None, correct_shift=True,
-                 kernel="spline36", a1=None, a2=None, nsize=0, nns=3, qual=None, etype=None, pscrn=None,
-                 opt=True, int16_prescreener=None, int16_predictor=None, exp=None, upsizer=None):
-    """nnedi3_rpow2 is for enlarging images by powers of 2.
-    Args:
-        rfactor (int): Image enlargement factor.
-            Must be a power of 2 in the range [2 to 1024].
-        correct_shift (bool): If False, the shift is not corrected.
-            The correction is accomplished by using the subpixel
-            cropping capability of fmtc's resizers.
-        width (int): If correcting the image center shift by using the
-            "correct_shift" parameter, width/height allow you to set a
-            new output resolution.
-        kernel (string): Sets the resizer used for correcting the image
-            center shift that nnedi3_rpow2 introduces. This can be any of
-            fmtc kernels, such as "cubic", "spline36", etc.
-            spline36 is the default one.
-        nnedi3_args (mixed): For help with nnedi3 args
-            refert to nnedi3 documentation.
-        upsizer (string): Which implementation to use: nnedi3, znedi3 or nnedi3cl.
-            If not selected the fastest available one will be chosen.
-    """
-
-    if width is None:
-        width = clip.width * rfactor
-    if height is None:
-        height = clip.height * rfactor
-    hshift = 0.0
-    vshift = -0.5
-    pkdnnedi = dict(
-        dh=True,
-        nsize=nsize,
-        nns=nns,
-        qual=qual,
-        etype=etype,
-        pscrn=pscrn,
-    )
-
-    tmp = 1
-    times = 0
-    while tmp < rfactor:
-        tmp *= 2
-        times += 1
-
-    if rfactor < 2 or rfactor > 1024:
-        raise ValueError("nnedi3_rpow2: rfactor must be between 2 and 1024.")
-
-    if tmp != rfactor:
-        raise ValueError("nnedi3_rpow2: rfactor must be a power of 2.")
-
-    if hasattr(core, "nnedi3cl") is True and (upsizer is None or upsizer == "nnedi3cl"):
-        nnedi3 = core.nnedi3cl.NNEDI3CL
-    elif hasattr(core, "znedi3") is True and (upsizer is None or upsizer == "znedi3"):
-        nnedi3 = core.znedi3.nnedi3
-        pkdnnedi.update(
-            opt=opt,
-            int16_prescreener=int16_prescreener,
-            int16_predictor=int16_predictor,
-            exp=exp,
-        )
-    elif hasattr(core, "nnedi3") is True and (upsizer is None or upsizer == "nnedi3"):
-        nnedi3 = core.nnedi3.nnedi3
-        pkdnnedi.update(
-            opt=opt,
-            int16_prescreener=int16_prescreener,
-            int16_predictor=int16_predictor,
-            exp=exp,
-        )
-    else:
-        if upsizer is not None:
-            print(f"nnedi3_rpow2: You chose \"{upsizer}\" but it cannot be found.")
-        raise RuntimeError("nnedi3_rpow2: nnedi3/znedi3/nnedi3cl plugin is required.")
-
-    if correct_shift or clip.format.subsampling_h:
-        if hasattr(core, "fmtc") is not True:
-            raise RuntimeError("nnedi3_rpow2: fmtconv plugin is required.")
-
-    last = clip
-
-    for i in range(times):
-        field = 1 if i == 0 else 0
-        last = nnedi3(last, field=field, **pkdnnedi)
-        last = core.std.Transpose(last)
-        if last.format.subsampling_w:
-            # Apparently always using field=1 for the horizontal pass somehow
-            # keeps luma/chroma alignment.
-            field = 1
-            hshift = hshift * 2 - 0.5
-        else:
-            hshift = -0.5
-        last = nnedi3(last, field=field, **pkdnnedi)
-        last = core.std.Transpose(last)
-
-    if clip.format.subsampling_h:
-        last = core.fmtc.resample(last, w=last.width, h=last.height, kernel=kernel, a1=a1, a2=a2, sy=-0.5, planes=[2, 3, 3])
-
-    if correct_shift is True:
-        last = core.fmtc.resample(last, w=width, h=height, kernel=kernel, a1=a1, a2=a2, sx=hshift, sy=vshift)
-
-    if last.format.id != clip.format.id:
-        last = core.fmtc.bitdepth(last, csp=clip.format.id)
-
-    return last

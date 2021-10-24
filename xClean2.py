@@ -6,9 +6,9 @@ import nnedi3_resample as nnedi3r
 
 """
 xClean 3-pass denoiser
-beta 5 (2021-10-20) by Etienne Charland
+beta 6 (2021-10-24) by Etienne Charland
 Supported formats: YUV, GRAY
-Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian, knlm, bm3d, bm3dcuda_rtc, bm3dcpu, neo_f3kdb, akarin
+Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian, knlm, bm3d, bm3dcuda_rtc, bm3dcpu, neo_f3kdb, akarin, nnedi3_resample, nnedi3cl
 
 xClean runs MVTools -> BM3D -> KNLMeans in that order, passing the output of each pass as the ref of the next denoiser.
 

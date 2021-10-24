@@ -2,6 +2,7 @@ from vapoursynth import core
 import vapoursynth as vs
 import math
 from typing import Optional
+import nnedi3_resample as nnedi3r
 
 """
 xClean 3-pass denoiser
@@ -127,8 +128,14 @@ to both luma and chroma. Default settings are suitable for most cases without ha
 Specifies the output bitdepth. If not specified it will be converted back to the bitdepth of the source clip using dithering method specified by dmode.
 You can set dmode=3 if you won't be doing any further processing for high-quality ditherig.
 
-+++ Chroma  (chroma=False) +++
-True to process both Luma and Chroma planes, False to process only Luma.
++++ Chroma upsampling/downsamping  (chroma=nnedi3, downchroma=True) +++
+Chroma upsampling options:
+none = don't touch chroma
+bicubic = bicubic(0, .5) upsampling
+nnedi3 = NNEDI3 upsampling
+reconstructor = feisty2's ChromaReconstructor_faster v3.0 HBD mod
+
+downchroma: whether to downscale back to match source clip. Default is False for reconstructor and True for other methods.
 
 +++ Anime +++
 For anime, set rn=0. Optionally, you can set depth to 1 or 2 to thicken the lines.
@@ -150,9 +157,9 @@ bm3d_fast = False. BM3D fast.
 conv = True. Whether to convert to OPP format for BM3D and YCgCoR for everything else. If false, it will process in standard YUV444.
 """
 
-def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: float = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .6, m2: int = 2, m3: int = 2, outbits: Optional[int] = None,
+def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: float = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .6, m2: int = 2, m3: int = 2, outbits: Optional[int] = None,
         dmode: int = 0, rgmode: int = 18, thsad: int = 400, d: int = 2, a: int = 2, h: float = 1.4, gpuid: int = 0, gpucuda: Optional[int] = None, sigma: float = 9, 
-        block_step: int = 4, bm_range: int = 16, ps_range: int = 8, radius: int = 0, bm3d_fast: bool = False, conv: bool = True) -> vs.VideoNode:
+        block_step: int = 4, bm_range: int = 16, ps_range: int = 8, radius: int = 0, bm3d_fast: bool = False, conv: bool = True, downchroma: bool = None) -> vs.VideoNode:
 
     if not clip.format.color_family in [vs.YUV, vs.GRAY]:
         raise TypeError("xClean: Only YUV or GRAY clips are supported")
@@ -176,17 +183,20 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         raise ValueError("xClean: m3 (KNLMeansCL pass) can be 0 (disabled), 1 (8-bit), 2 (16-bit), 3 (32-bit)")
     if m1 == 0 and m2 == 0 and m3 == 0:
         raise ValueError("xClean: At least one pass must be enabled")
+    if not chroma in ["none", "bicubic", "nnedi3", "reconstructor"]:
+        raise ValueError("xClean: chroma must be none, bicubic, nnedi3 or reconstructor")
 
     uv = clip
-    if not chroma:
+    if chroma == "none":
         clip = core.std.ShufflePlanes(clip, 0, vs.GRAY)
     
     samp = ClipSampling(clip)
     isGray = samp == "GRAY"
     if isGray:
-        chroma = False
-        opp = False
+        chroma = "none"
         conv = False
+    dochroma = chroma != "none"
+    downchroma = downchroma or False if chroma == "reconstructor" else True
 
     gpucuda = gpucuda if gpucuda != None else gpuid
     bd = clip.format.bits_per_sample
@@ -196,7 +206,11 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         raise ValueError("xClean: outbits must be 8, 10, 12, 14, 16 or 32")
     
     # Reference clips are in RGB or GRAY format, to allow converting to desired formats
-    c16 = clip.resize.Bicubic(format=vs.RGB48 if conv else vs.YUV444P16, matrix_in=GetMatrix(clip), filter_param_a_uv=0, filter_param_b_uv=.5) if not isGray else ConvertBits(clip, 16, fulls, True)
+    cchroma = clip if samp == "444" else \
+        ChromaReconstructor(clip, gpuid) if chroma == "reconstructor" else \
+        nnedi3r.nnedi3_resample(clip, fulls=fulls, fulld=fulls, csp=vs.YUV444P16) if chroma == "nnedi3" else \
+        core.resize.Bicubic(clip, format=vs.YUV444P16, filter_param_a_uv=0, filter_param_b_uv=.5)
+    c16 = cchroma.resize.Bicubic(format=vs.RGB48 if conv else vs.YUV444P16, matrix_in=GetMatrix(clip)) if not isGray else ConvertBits(clip, 16, fulls, True)
     c32 = ConvertBits(c16, 32, fulls, False)
     c8 = ConvertBits(c16, 8, fulls, False)
     output = None
@@ -260,17 +274,17 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
     if deband:
         if output.format.bits_per_sample == 32:
             output = ConvertBits(output, 16, fulls, False)
-        output = output.neo_f3kdb.Deband(range=16, preset="high" if chroma else "luma", grainy=defH/15, grainc=defH/16 if chroma else 0)
+        output = output.neo_f3kdb.Deband(range=16, preset="high" if dochroma else "luma", grainy=defH/15, grainc=defH/16 if dochroma else 0)
 
     # Convert to desired output format and bitrate
     output = YCgCoR_to_RGB(output, fulls) if conv else output
-    fmt = GetFormat(samp, output.format.bits_per_sample)
+    fmt = GetFormat(samp if downchroma else "444", output.format.bits_per_sample)
     output = output.resize.Bicubic(format=fmt, matrix=GetMatrix(clip), chromaloc=GetChromaLoc(clip), range=1 if fulls else 0, filter_param_a_uv=0, filter_param_b_uv=.5)
     if output.format.bits_per_sample != outbits:
         output = output.fmtc.bitdepth(bits=outbits, fulls=fulls, fulld=fulls, dmode=dmode)
      
     # Merge source chroma planes if not processing chroma.
-    if not chroma and uv.format.color_family == vs.YUV:
+    if not dochroma and uv.format.color_family == vs.YUV:
         if uv.format.bits_per_sample != outbits:
             uv = ConvertBits(uv, outbits, fulls, True)
         output = core.std.ShufflePlanes([output, uv], [0, 1, 2], vs.YUV)
@@ -337,12 +351,12 @@ def PostProcessing(clean: vs.VideoNode, c: vs.VideoNode, defH: int, strength: in
         peak = 1.0 if bd == 32 else (1 << bd) - 1
         expr = "x {a} < 0 x {b} > {p} 0 x {c} - {p} {a} {d} - / * - ? ?".format(a=32*i, b=45*i, c=35*i, d=65*i, p=peak)
         clean1 = core.std.Merge(clean2, core.std.MergeDiff(clean2, Tweak(noise_diff.tmedian.TemporalMedian(), cont=1.008+0.00016*rn)), 0.3+rn*0.035)
-        clean2 = core.std.MaskedMerge(clean2, clean1, core.akarin.Expr([core.akarin.Expr([clean, clean.std.Invert()], 'x y min')], [expr]))
+        clean2 = core.std.MaskedMerge(clean2, clean1, core.std.Expr([core.std.Expr([clean, clean.std.Invert()], 'x y min')], [expr]))
 
     # Combining spatial detail enhancement with spatial noise reduction using prepared mask
     noise_diff = noise_diff.std.Binarize().std.Invert()
     if rgmode > 0:
-        clean2 = core.std.MaskedMerge(clean2, clsharp if sharp else clean, core.akarin.Expr([noise_diff, clean.std.Sobel()], 'x y max'))
+        clean2 = core.std.MaskedMerge(clean2, clsharp if sharp else clean, core.std.Expr([noise_diff, clean.std.Sobel()], 'x y max'))
 
     # Combining result of luma and chroma cleaning
     return core.std.ShufflePlanes([clean2, filt], [0, 1, 2], vs.YUV) if c.format.color_family == vs.YUV else clean2
@@ -446,7 +460,7 @@ def Tweak(clip: vs.VideoNode, bright: float = None, cont: float = None) -> vs.Vi
 
         if isFLOAT:
             expr = "x {} * {} + 0.0 max 1.0 min".format(cont, bright)
-            clip =  core.akarin.Expr([clip], [expr] if isGRAY else [expr, ''])
+            clip =  core.std.Expr([clip], [expr] if isGRAY else [expr, ''])
         else:
             luma_lut = []
             luma_min = 16  << (bd - 8) if not fulls else 0
@@ -564,9 +578,9 @@ def RGB_to_YCgCoR (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
     G = core.std.ShufflePlanes(c, [1], vs.GRAY)
     B = core.std.ShufflePlanes(c, [2], vs.GRAY)
 
-    Co = core.akarin.Expr([R,      B], ex_dlut("x 0.5  * y 0.5  * - range_half +",                bd, fulls))
-    Cg = core.akarin.Expr([Co, G,  B], ex_dlut("y z x range_half - 0.5 * + - 0.5 * range_half +", bd, fulls))
-    Y  = core.akarin.Expr([Co, Cg, B], ex_dlut("z x range_half - 0.5 * + y range_half - +",       bd, fulls))
+    Co = core.std.Expr([R,      B], ex_dlut("x 0.5  * y 0.5  * - range_half +",                bd, fulls))
+    Cg = core.std.Expr([Co, G,  B], ex_dlut("y z x range_half - 0.5 * + - 0.5 * range_half +", bd, fulls))
+    Y  = core.std.Expr([Co, Cg, B], ex_dlut("z x range_half - 0.5 * + y range_half - +",       bd, fulls))
 
     output = core.std.ShufflePlanes([Y, Cg, Co], [0, 0, 0], vs.YUV)
     return output.std.SetFrameProp(prop='_Matrix', intval=2)
@@ -583,8 +597,8 @@ def YCgCoR_to_RGB (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
     Co = core.std.ShufflePlanes(c, [2], vs.GRAY)
 
     G = core.akarin.Expr([Y, Cg    ], ex_dlut("y range_half - dup yvar! 2 * x yvar@ - +",             bd, fulls))
-    B = core.akarin.Expr([Y, Cg, Co], ex_dlut("x y range_half - - z range_half - 0.5 * -", bd, fulls))
-    R = core.akarin.Expr([Co, B    ], ex_dlut("y x range_half - 2 * +",                    bd, fulls))
+    B = core.std.Expr([Y, Cg, Co], ex_dlut("x y range_half - - z range_half - 0.5 * -", bd, fulls))
+    R = core.std.Expr([Co, B    ], ex_dlut("y x range_half - 2 * +",                    bd, fulls))
 
     output = core.std.ShufflePlanes([R, G, B], [0, 0, 0], vs.RGB)
     return output.std.SetFrameProp(prop='_Matrix', intval=0)
@@ -601,9 +615,9 @@ def RGB_to_OPP (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
 
     b32 = "" if bd == 32 else "range_half +"
 
-    O  = core.akarin.Expr([R, G, B], ex_dlut("x y z + + 0.333333333 *",     bd, fulls))
-    P1 = core.akarin.Expr([R,    B], ex_dlut("x y - 0.5 * "+b32,            bd, fulls))
-    P2 = core.akarin.Expr([R, G, B], ex_dlut("x z + 0.25 * y 0.5 * - "+b32, bd, fulls))
+    O  = core.std.Expr([R, G, B], ex_dlut("x y z + + 0.333333333 *",     bd, fulls))
+    P1 = core.std.Expr([R,    B], ex_dlut("x y - 0.5 * "+b32,            bd, fulls))
+    P2 = core.std.Expr([R, G, B], ex_dlut("x z + 0.25 * y 0.5 * - "+b32, bd, fulls))
 
     output = core.std.ShufflePlanes([O, P1, P2], [0, 0, 0], vs.YUV)
     return output.std.SetFrameProp(prop='_Matrix', intval=2)
@@ -620,9 +634,9 @@ def OPP_to_RGB (c: vs.VideoNode, fulls: bool = False):
 
     b32 = "" if bd == 32 else "range_half -"
 
-    R = core.akarin.Expr([O, P1, P2], ex_dlut("x y "+b32+" + z "+b32+" 0.666666666 * +", bd, fulls))
-    G = core.akarin.Expr([O,     P2], ex_dlut("x y "+b32+" 1.333333333 * -",             bd, fulls))
-    B = core.akarin.Expr([O, P1, P2], ex_dlut("x z "+b32+" 0.666666666 * + y "+b32+" -", bd, fulls))
+    R = core.std.Expr([O, P1, P2], ex_dlut("x y "+b32+" + z "+b32+" 0.666666666 * +", bd, fulls))
+    G = core.std.Expr([O,     P2], ex_dlut("x y "+b32+" 1.333333333 * -",             bd, fulls))
+    B = core.std.Expr([O, P1, P2], ex_dlut("x z "+b32+" 0.666666666 * + y "+b32+" -", bd, fulls))
 
     output = core.std.ShufflePlanes([R, G, B], [0, 0, 0], vs.RGB)
     return output.std.SetFrameProp(prop='_Matrix', intval=0)
@@ -678,3 +692,128 @@ def ex_dlut(expr: str = "", bits: int = 8, fulls: bool = False) -> str:
     expr = expr.replace("range_max",               str(range_max[fs]))
     expr = expr.replace("range_size",              str(range_size[fs]))
     return expr
+
+
+# feisty2's ChromaReconstructor_faster v3.0 HBD mod
+def ChromaReconstructor(clip: vs.VideoNode, gpuid: int = 0):
+    w = clip.width
+    h = clip.height
+    Y = core.std.ShufflePlanes(clip, [0], vs.GRAY)
+    Uor = core.std.ShufflePlanes(clip, [1], vs.GRAY)
+    Vor = core.std.ShufflePlanes(clip, [2], vs.GRAY)
+    device = dict(device_type="auto" if gpuid >= 0 else "cpu", device_id=max(0, gpuid))
+
+    ref     = Y.knlm.KNLMeansCL(0, 16, 0, pow(1.464968620512209618455732713658, 6.4), wref=1, **device)
+    Luma    = nnedi3_rpow2(ref, rfactor=2, nns=1, qual=1, etype=1, nsize=0)
+    Uu      = nnedi3_rpow2(Uor, rfactor=2, nns=1, qual=1, etype=1, nsize=0, width=w*2, height=h*2, kernel="Bicubic") #, ep0=0.0, ep1=0.75, cshift="bicubicresize")
+    Vu      = nnedi3_rpow2(Vor, rfactor=2, nns=1, qual=1, etype=1, nsize=0, width=w*2, height=h*2) #, ep0=0.0, ep1=0.75, cshift="bicubicresize")
+    Unew    = Uu.knlm.KNLMeansCL(0, 16, 0, 6.4, wref=0, rclip=Luma, **device).resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)
+    Vnew    = Vu.knlm.KNLMeansCL(0, 16, 0, 6.4, wref=0, rclip=Luma, **device).resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)
+    U       = core.std.MergeDiff(Unew, core.std.MakeDiff(Unew.std.Convolution(matrix=[1, 1, 1, 1, 0, 1, 1, 1, 1]), Uu.resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)))
+    V       = core.std.MergeDiff(Vnew, core.std.MakeDiff(Vnew.std.Convolution(matrix=[1, 1, 1, 1, 0, 1, 1, 1, 1]), Vu.resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)))
+    return core.std.ShufflePlanes([Y, U, V], [0, 0, 0], vs.YUV)
+
+
+def nnedi3_rpow2(clip, rfactor=2, width=None, height=None, correct_shift=True,
+                 kernel="spline36", a1=None, a2=None, nsize=0, nns=3, qual=None, etype=None, pscrn=None,
+                 opt=True, int16_prescreener=None, int16_predictor=None, exp=None, upsizer=None):
+    """nnedi3_rpow2 is for enlarging images by powers of 2.
+    Args:
+        rfactor (int): Image enlargement factor.
+            Must be a power of 2 in the range [2 to 1024].
+        correct_shift (bool): If False, the shift is not corrected.
+            The correction is accomplished by using the subpixel
+            cropping capability of fmtc's resizers.
+        width (int): If correcting the image center shift by using the
+            "correct_shift" parameter, width/height allow you to set a
+            new output resolution.
+        kernel (string): Sets the resizer used for correcting the image
+            center shift that nnedi3_rpow2 introduces. This can be any of
+            fmtc kernels, such as "cubic", "spline36", etc.
+            spline36 is the default one.
+        nnedi3_args (mixed): For help with nnedi3 args
+            refert to nnedi3 documentation.
+        upsizer (string): Which implementation to use: nnedi3, znedi3 or nnedi3cl.
+            If not selected the fastest available one will be chosen.
+    """
+
+    if width is None:
+        width = clip.width * rfactor
+    if height is None:
+        height = clip.height * rfactor
+    hshift = 0.0
+    vshift = -0.5
+    pkdnnedi = dict(
+        dh=True,
+        nsize=nsize,
+        nns=nns,
+        qual=qual,
+        etype=etype,
+        pscrn=pscrn,
+    )
+
+    tmp = 1
+    times = 0
+    while tmp < rfactor:
+        tmp *= 2
+        times += 1
+
+    if rfactor < 2 or rfactor > 1024:
+        raise ValueError("nnedi3_rpow2: rfactor must be between 2 and 1024.")
+
+    if tmp != rfactor:
+        raise ValueError("nnedi3_rpow2: rfactor must be a power of 2.")
+
+    if hasattr(core, "nnedi3cl") is True and (upsizer is None or upsizer == "nnedi3cl"):
+        nnedi3 = core.nnedi3cl.NNEDI3CL
+    elif hasattr(core, "znedi3") is True and (upsizer is None or upsizer == "znedi3"):
+        nnedi3 = core.znedi3.nnedi3
+        pkdnnedi.update(
+            opt=opt,
+            int16_prescreener=int16_prescreener,
+            int16_predictor=int16_predictor,
+            exp=exp,
+        )
+    elif hasattr(core, "nnedi3") is True and (upsizer is None or upsizer == "nnedi3"):
+        nnedi3 = core.nnedi3.nnedi3
+        pkdnnedi.update(
+            opt=opt,
+            int16_prescreener=int16_prescreener,
+            int16_predictor=int16_predictor,
+            exp=exp,
+        )
+    else:
+        if upsizer is not None:
+            print(f"nnedi3_rpow2: You chose \"{upsizer}\" but it cannot be found.")
+        raise RuntimeError("nnedi3_rpow2: nnedi3/znedi3/nnedi3cl plugin is required.")
+
+    if correct_shift or clip.format.subsampling_h:
+        if hasattr(core, "fmtc") is not True:
+            raise RuntimeError("nnedi3_rpow2: fmtconv plugin is required.")
+
+    last = clip
+
+    for i in range(times):
+        field = 1 if i == 0 else 0
+        last = nnedi3(last, field=field, **pkdnnedi)
+        last = core.std.Transpose(last)
+        if last.format.subsampling_w:
+            # Apparently always using field=1 for the horizontal pass somehow
+            # keeps luma/chroma alignment.
+            field = 1
+            hshift = hshift * 2 - 0.5
+        else:
+            hshift = -0.5
+        last = nnedi3(last, field=field, **pkdnnedi)
+        last = core.std.Transpose(last)
+
+    if clip.format.subsampling_h:
+        last = core.fmtc.resample(last, w=last.width, h=last.height, kernel=kernel, a1=a1, a2=a2, sy=-0.5, planes=[2, 3, 3])
+
+    if correct_shift is True:
+        last = core.fmtc.resample(last, w=width, h=height, kernel=kernel, a1=a1, a2=a2, sx=hshift, sy=vshift)
+
+    if last.format.id != clip.format.id:
+        last = core.fmtc.bitdepth(last, csp=clip.format.id)
+
+    return last

@@ -1,13 +1,14 @@
-from vapoursynth import core
+from vapoursynth import RGB, ColorFamily, core
 import vapoursynth as vs
 import math
 from typing import Optional
+import nnedi3_resample as nnedi3
 
 """
 xClean 3-pass denoiser
-beta 5 (2021-10-20) by Etienne Charland
-Supported formats: YUV, GRAY
-Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian, knlm, bm3d, bm3dcuda_rtc, bm3dcpu, neo_f3kdb, akarin
+beta 6 (2021-10-24) by Etienne Charland
+Supported formats: YUV, RGB, GRAY
+Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian, knlm, bm3d, bm3dcuda_rtc, bm3dcpu, neo_f3kdb, akarin, nnedi3_resample, nnedi3cl
 
 xClean runs MVTools -> BM3D -> KNLMeans in that order, passing the output of each pass as the ref of the next denoiser.
 
@@ -50,6 +51,8 @@ very noisy 720p WebCam footage has HUGE noise reduction while preserving a surpr
 
 The default settings are very tolerant to various types of clips.
 
+All processing is done in YUV444 format. When conv=True, processing is done in YCgCoR, and in OPP colorspace for BM3D.
+
 
 +++ Denoising Methods Overview +++
 To provide the best output, processing is done in 3 passes, passing the output of one pass as the ref clip of the 2nd pass. Each denoiser has its strengths and weaknesses.
@@ -70,14 +73,14 @@ Weakness: Can blur out details and give an artificial plastic effect
 Ref: High impact the outcome. All prefilters benefit from running KNLMeans over it.
 
 
-+++ Denoising Pass Configuration  (m1=.6, m2=3, m3=3) +++
++++ Denoising Pass Configuration  (m1=.6, m2=2, m3=2) +++
 Each pass (method) can be configured with m1 (MVTools), m2 (BM3D) and m3 (KNLMeansCL) parameters to run at desired bitdepth.
 This means you can fine-tune for quality vs performance.
 
-0 = Disabled, 1 = 8-bit, 2 = 16-bit, 3 = 16-bit YUV444, 4 = 32-bit YUV444
+0 = Disabled, 1 = 8-bit, 2 = 16-bit, 3 = 32-bit
 
 Note: BM3D always processes in 32-bit, KNLMeansCL always processes in 16-bit+, and post-processing always processes at least in 16-bit, so certain
-values such as m2=1, m3=1 will behave the same as m2=2, m3=2. Setting m2=2 instead of 3 will only affect BM3D post-processing (YUV420P16 instead of YUV444P16)
+values such as m2=1, m3=1 will behave the same as m2=2, m3=2. Setting m2=2 instead of 3 will only affect BM3D post-processing (YUV444P16 instead of YUV444PS)
 
 MVTools (m1) and BM3D (m2) passes can also be downscaled for performance gain, and it can even improve quality! Values between .5 and .8 generally work best.
 
@@ -125,8 +128,14 @@ to both luma and chroma. Default settings are suitable for most cases without ha
 Specifies the output bitdepth. If not specified it will be converted back to the bitdepth of the source clip using dithering method specified by dmode.
 You can set dmode=3 if you won't be doing any further processing for high-quality ditherig.
 
-+++ Chroma  (chroma=False) +++
-True to process both Luma and Chroma planes, False to process only Luma.
++++ Chroma upsampling/downsamping  (chroma=nnedi3, downchroma=True) +++
+Chroma upsampling options:
+none = don't touch chroma
+bicubic = bicubic(0, .5) upsampling
+nnedi3 = NNEDI3 upsampling
+reconstructor = feisty2's ChromaReconstructor_faster v3.0 HBD mod
+
+downchroma: whether to downscale back to match source clip. Default is False for reconstructor and True for other methods.
 
 +++ Anime +++
 For anime, set rn=0. Optionally, you can set depth to 1 or 2 to thicken the lines.
@@ -145,17 +154,19 @@ d = 2: KNLMeans temporal radius. Setting 3 can either slightly improve quality o
 a = 2: KNLMeans spacial radius.
 sigma = 9: BM3D strength.
 bm3d_fast = False. BM3D fast.
-opp = True. Whether to convert to OPP format for BM3D, and to YCgCoR format for KNLMeans.
+conv = True. Whether to convert to OPP format for BM3D and YCgCoR for everything else. If false, it will process in standard YUV444.
 """
 
-def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: float = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .6, m2: int = 3, m3: int = 3, outbits: Optional[int] = None,
+def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: float = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .6, m2: int = 2, m3: int = 2, outbits: Optional[int] = None,
         dmode: int = 0, rgmode: int = 18, thsad: int = 400, d: int = 2, a: int = 2, h: float = 1.4, gpuid: int = 0, gpucuda: Optional[int] = None, sigma: float = 9, 
-        block_step: int = 4, bm_range: int = 16, ps_range: int = 8, radius: int = 0, bm3d_fast: bool = False, opp: bool = True) -> vs.VideoNode:
+        block_step: int = 4, bm_range: int = 16, ps_range: int = 8, radius: int = 0, bm3d_fast: bool = False, conv: bool = True, downchroma: bool = None) -> vs.VideoNode:
 
-    if not clip.format.color_family in [vs.YUV, vs.GRAY]:
-        raise TypeError("xClean: Only YUV or GRAY clips are supported")
+    # if not clip.format.color_family in [vs.YUV, vs.GRAY]:
+    #     raise TypeError("xClean: Only YUV or GRAY clips are supported")
 
-    defH = max(clip.height, clip.width // 4 * 3) # Resolution calculation for auto blksize settings
+    width = clip.width
+    height = clip.height
+    defH = max(height, width // 4 * 3) # Resolution calculation for auto blksize settings
     if sharp < 0 or sharp > 20:
         raise ValueError("xClean: sharp must be between 0 and 20")
     if rn < 0 or rn > 20:
@@ -164,75 +175,94 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
         raise ValueError("xClean: depth must be between 0 and 5")
     if strength < -200 or strength > 20:
         raise ValueError("xClean: strength must be between -200 and 20")
-    if m1 < 0 or m1 >= 5:
-        raise ValueError(r"xClean: m1 (MVTools pass) can be 0 (disabled), 1 (8-bit), 2 (16-bit), 3 (16-bit YUV444) or 4 (32-bit YUV444), plus an optional downscale ratio as decimal (eg: 2.6 resizes to 60% in 16-bit)")
-    if m2 < 0 or m2 > 4:
-        raise ValueError("xClean: m2 (BM3D pass) can be 0 (disabled), 1 (8-bit), 2 (16-bit), 3 (16-bit YUV444) or 4 (32-bit YUV444)")
-    if m3 < 0 or m3 > 4:
-        raise ValueError("xClean: m3 (KNLMeansCL pass) can be 0 (disabled), 1 (8-bit), 2 (16-bit), 3 (16-bit YUV444) or 4 (32-bit YUV444)")
+    if m1 < 0 or m1 >= 4:
+        raise ValueError(r"xClean: m1 (MVTools pass) can be 0 (disabled), 1 (8-bit), 2 (16-bit), 3 (32-bit), plus an optional downscale ratio as decimal (eg: 2.6 resizes to 60% in 16-bit)")
+    if m2 < 0 or m2 >= 4:
+        raise ValueError("xClean: m2 (BM3D pass) can be 0 (disabled), 1 (8-bit), 2 (16-bit), 3 (32-bit), plus an optional downscale ratio as decimal (eg: 2.6 resizes to 60% in 16-bit)")
+    if m3 < 0 or m3 > 3:
+        raise ValueError("xClean: m3 (KNLMeansCL pass) can be 0 (disabled), 1 (8-bit), 2 (16-bit), 3 (32-bit)")
     if m1 == 0 and m2 == 0 and m3 == 0:
         raise ValueError("xClean: At least one pass must be enabled")
+    if not chroma in ["none", "bicubic", "nnedi3", "reconstructor"]:
+        raise ValueError("xClean: chroma must be none, bicubic, nnedi3 or reconstructor")
 
     uv = clip
-    if not chroma:
+    if chroma == "none":
         clip = core.std.ShufflePlanes(clip, 0, vs.GRAY)
+    
+    samp = ClipSampling(clip)
+    isGray = samp == "GRAY"
+    if isGray:
+        chroma = "none"
+        conv = False
+    dochroma = chroma != "none" or samp == "RGB"
+    downchroma = downchroma or False if chroma == "reconstructor" else True
 
     gpucuda = gpucuda if gpucuda != None else gpuid
     bd = clip.format.bits_per_sample
     fulls = GetColorRange(clip) == 0
-    samp = ClipSampling(clip)
-    is444 = samp == "444"
-    isGray = samp == "GRAY"
     outbits = outbits or bd
     if not outbits in [8, 10, 12, 14, 16, 32]:
         raise ValueError("xClean: outbits must be 8, 10, 12, 14, 16 or 32")
     
-    c = c16 = c16_444 = c32_444 = clip
-    if bd != 8:
-        c = ConvertBits(c, 8, fulls, True)
-    if bd != 16:
-        c16 = ConvertBits(c, 16, fulls, True)
-    if bd != 16 or not is444:
-        c16_444 = clip.resize.Bicubic(format=vs.YUV444P16) if not isGray else c16
-    if bd != 32 or not is444:
-        c32_444 = clip.resize.Bicubic(format=vs.YUV444PS) if not isGray else ConvertBits(c, 32, fulls, False)
+    # Reference clips are in RGB or GRAY format, to allow converting to desired formats
+    cchroma = clip if samp in ["444", "RGB"] else \
+        ChromaReconstructor(clip, gpuid) if chroma == "reconstructor" else \
+        nnedi3.nnedi3_resample(clip, fulls=fulls, fulld=fulls, csp=vs.YUV444P16, mode="nnedi3cl" if gpuid >= 0 else "znedi3", device=max(0, gpuid)) if chroma == "nnedi3" else \
+        core.resize.Bicubic(clip, format=vs.YUV444P16, filter_param_a_uv=0, filter_param_b_uv=.5)
+    c16 = cchroma.resize.Bicubic(format=vs.RGB48 if conv else vs.YUV444P16, matrix_in=GetMatrix(clip)) if not isGray else ConvertBits(clip, 16, fulls, True)
+    c32 = ConvertBits(c16, 32, fulls, False)
+    c8 = ConvertBits(c16, 8, fulls, False)
     output = None
 
     # Apply MVTools
     if m1 > 0:
         m1r = 1 if m1 == int(m1) else m1 % 1 # Decimal point is resize factor
         m1 = int(m1)
-        c1 = c32_444 if m1 == 4 else c16_444 if m1 == 3 else c16 if m1 == 2 else c
-        c1r = c1.resize.Bicubic((c.width * m1r)//4*4, (c.height * m1r)//4*4, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.75, filter_param_b_uv=.75) if m1r < 1 else c1
-        output = MvTools(c1r, defH, thsad)
+        c1 = c32 if m1 == 3 else c16 if m1 == 2 else c8
+        c1 = c1.resize.Bicubic((width * m1r)//4*4, (height * m1r)//4*4, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.75, filter_param_b_uv=.75) if m1r < 1 else c1
+        c1 = RGB_to_YCgCoR(c1, fulls) if conv else c1
+        output = MvTools(c1, defH, thsad)
         sharp1 = max(0, min(20, sharp + (1 - m1r) * .35))
-        output = PostProcessing(output, c1r, defH, strength, sharp1, rn, rgmode, 0)
+        output = PostProcessing(output, c1, defH, strength, sharp1, rn, rgmode, 0)
+        # output in YCgCoR format
 
     # Apply BM3D
     if m2 > 0:
         m2r = 1 if m2 == int(m2) else m2 % 1 # Decimal point is resize factor
         m2 = int(m2)
         m2o = max(2, max(m2, m3))
-        c2 = c32_444 if m2o==4 else c16_444 if m2o==3 else c16
-        ref = output.resize.Spline36((c.width * m2r)//4*4, (c.height * m2r)//4*4, format=c2.format) if output else None
-        c2r = c2.resize.Bicubic((c.width * m2r)//4*4, (c.height * m2r)//4*4, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.5, filter_param_b_uv=.5) if m2r < 1 else c2
-        output = BM3D(c2r, ref, sigma, gpucuda, m2o, block_step, bm_range, ps_range, radius, bm3d_fast, opp)
-        output = output.resize.Spline36(c.width, c.height) if m2r < 1 else output
+        c2 = c32 if m2o==3 else c16
+        ref = RGB_to_OPP(YCgCoR_to_RGB(output, fulls), fulls) if output and conv else output if output else None
+        ref = ref.resize.Spline36((width * m2r)//4*4, (height * m2r)//4*4, format = GetFormat(ClipSampling(ref), 32)) if ref else None
+        #ref = ConvertBits(ref, 32, fulls, False) if ref else None
+        c2r = c2.resize.Bicubic((width * m2r)//4*4, (height * m2r)//4*4, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.5, filter_param_b_uv=.5) if m2r < 1 else c2
+        c2r = ConvertBits(RGB_to_OPP(c2r, fulls) if conv else c2r, 32, fulls, False)
+
+        output = BM3D(c2r, ref, sigma, gpucuda, block_step, bm_range, ps_range, radius, bm3d_fast)
+        
+        output = ConvertBits(output, c2.format.bits_per_sample, fulls, False)
+        output = RGB_to_YCgCoR(OPP_to_RGB(output, fulls), fulls) if conv else output
+        c2 = RGB_to_YCgCoR(c2, fulls) if conv else c2
+        output = output.resize.Spline36(width, height) if m2r < 1 else output
         sharp2 = max(0, min(20, sharp + (1 - m2r) * .95))
         output = PostProcessing(output, c2, defH, strength, sharp2, rn, rgmode, 1)
+        # output in YCgCoR format
 
-    if output.height < c.height:
-        output = output.resize.Spline36(c.width, c.height)
+    if output and output.height < height:
+        output = output.resize.Spline36(width, height)
 
     # Apply KNLMeans
     if m3 > 0:
         m3 = min(2, m3) # KNL internally computes in 16-bit
-        ref = ConvertToM(output, clip, m3) if output else None
-        c3 = c32_444 if m3==4 else c16_444 if m3==3 or ClipSampling(ref) == "444" else c16
-        output = KnlMeans(c3, ref, d, a, h, gpuid, opp)
+        c3 = c32 if m3==3 else c16
+        c3 = RGB_to_YCgCoR(c3, fulls) if conv else c3
+        ref = ConvertBits(output, c3.format.bits_per_sample, fulls, False) if output else None
+        output = KnlMeans(c3, ref, d, a, h, gpuid)
         # Adjust sharp based on h parameter.
         sharp3 = max(0, min(20, sharp - .5 + (h/2.8)))
         output = PostProcessing(output, c3, defH, strength, sharp3, rn, rgmode, 2)
+        # output in YCgCoR format
 
     # Add Depth (thicken lines for anime)
     if depth:
@@ -244,17 +274,17 @@ def xClean(clip: vs.VideoNode, chroma: bool = True, sharp: float = 9.5, rn: floa
     if deband:
         if output.format.bits_per_sample == 32:
             output = ConvertBits(output, 16, fulls, False)
-        output = output.neo_f3kdb.Deband(range=16, preset="high" if chroma else "luma", grainy=defH/15, grainc=defH/16 if chroma else 0)
+        output = output.neo_f3kdb.Deband(range=16, preset="high" if dochroma else "luma", grainy=defH/15, grainc=defH/16 if dochroma else 0)
 
-    # Convert to desired bitrate
-    outsamp = ClipSampling(output)
-    if outsamp != samp:
-        output = output.fmtc.resample(kernel="bicubic", css=samp, fulls=fulls, fulld=fulls)
+    # Convert to desired output format and bitrate
+    output = YCgCoR_to_RGB(output, fulls) if conv else output
+    fmt = GetFormat(samp if samp=="RGB" or downchroma else "444", output.format.bits_per_sample)
+    output = output.resize.Bicubic(format=fmt, matrix=GetMatrix(clip), chromaloc=GetChromaLoc(clip), range=1 if fulls else 0, filter_param_a_uv=0, filter_param_b_uv=.5)
     if output.format.bits_per_sample != outbits:
         output = output.fmtc.bitdepth(bits=outbits, fulls=fulls, fulld=fulls, dmode=dmode)
-    
+     
     # Merge source chroma planes if not processing chroma.
-    if not chroma and uv.format.color_family == vs.YUV:
+    if not dochroma and uv.format.color_family == vs.YUV:
         if uv.format.bits_per_sample != outbits:
             uv = ConvertBits(uv, outbits, fulls, True)
         output = core.std.ShufflePlanes([output, uv], [0, 1, 2], vs.YUV)
@@ -321,12 +351,12 @@ def PostProcessing(clean: vs.VideoNode, c: vs.VideoNode, defH: int, strength: in
         peak = 1.0 if bd == 32 else (1 << bd) - 1
         expr = "x {a} < 0 x {b} > {p} 0 x {c} - {p} {a} {d} - / * - ? ?".format(a=32*i, b=45*i, c=35*i, d=65*i, p=peak)
         clean1 = core.std.Merge(clean2, core.std.MergeDiff(clean2, Tweak(noise_diff.tmedian.TemporalMedian(), cont=1.008+0.00016*rn)), 0.3+rn*0.035)
-        clean2 = core.std.MaskedMerge(clean2, clean1, core.akarin.Expr([core.akarin.Expr([clean, clean.std.Invert()], 'x y min')], [expr]))
+        clean2 = core.std.MaskedMerge(clean2, clean1, core.std.Expr([core.std.Expr([clean, clean.std.Invert()], 'x y min')], [expr]))
 
     # Combining spatial detail enhancement with spatial noise reduction using prepared mask
     noise_diff = noise_diff.std.Binarize().std.Invert()
     if rgmode > 0:
-        clean2 = core.std.MaskedMerge(clean2, clsharp if sharp else clean, core.akarin.Expr([noise_diff, clean.std.Sobel()], 'x y max'))
+        clean2 = core.std.MaskedMerge(clean2, clsharp if sharp else clean, core.std.Expr([noise_diff, clean.std.Sobel()], 'x y max'))
 
     # Combining result of luma and chroma cleaning
     return core.std.ShufflePlanes([clean2, filt], [0, 1, 2], vs.YUV) if c.format.color_family == vs.YUV else clean2
@@ -381,35 +411,25 @@ def MvTools(c: vs.VideoNode, defH: int, thSAD: int) -> vs.VideoNode:
 
 
 # BM3D denoising method
-def BM3D(clip: vs.VideoNode, ref: Optional[vs.VideoNode], sigma: float, gpuid: int, m: int, block_step: int, bm_range: int, ps_range: int, radius: int, bm3d_fast: bool, opp: bool) -> vs.VideoNode:
+def BM3D(clip: vs.VideoNode, ref: Optional[vs.VideoNode], sigma: float, gpuid: int, block_step: int, bm_range: int, ps_range: int, radius: int, bm3d_fast: bool) -> vs.VideoNode:
     matrix = GetMatrix(clip)
     fulls = GetColorRange(clip)
     chroma = clip.format.color_family==vs.YUV
-    opp = opp and chroma
     icalc = clip.format.bits_per_sample < 32
-    clean = YUV2OPP(clip, 1) if opp else clip.resize.Bicubic(format=vs.YUV444PS if chroma else vs.GRAYS, matrix_in=matrix)
-    if ref:
-        ref = YUV2OPP(ref, 1) if opp else ref.resize.Bicubic(format=vs.YUV444PS if chroma else vs.GRAYS, matrix_in=matrix)
     if gpuid >= 0:
-        clean = core.bm3dcuda_rtc.BM3D(clean, ref, chroma=chroma, sigma=sigma, device_id=gpuid, fast=bm3d_fast, radius=radius, block_step=block_step, bm_range=bm_range, ps_range=ps_range)
+        clean = core.bm3dcuda_rtc.BM3D(clip, ref, chroma=chroma, sigma=sigma, device_id=gpuid, fast=bm3d_fast, radius=radius, block_step=block_step, bm_range=bm_range, ps_range=ps_range)
     else:
-        clean = core.bm3dcpu.BM3D(clean, ref, chroma=chroma, sigma=sigma, block_step=block_step, bm_range=bm_range, ps_range=ps_range, radius=radius)
+        clean = core.bm3dcpu.BM3D(clip, ref, chroma=chroma, sigma=sigma, block_step=block_step, bm_range=bm_range, ps_range=ps_range, radius=radius)
     clean = clean.bm3d.VAggregate(sample=0 if icalc else 1) if radius > 0 else clean
-    clean = OPP2YUV(clean, clip, vs.YUV444P16 if m < 4 else vs.YUV444PS) if opp else clean
-    return ConvertToM(clean, clip, m)
+    return clean
 
 
 # KnlMeansCL denoising method, useful for dark noisy scenes
-def KnlMeans(clip: vs.VideoNode, ref: Optional[vs.VideoNode], d: int, a: int, h: float, gpuid: int, opp: bool) -> vs.VideoNode:
+def KnlMeans(clip: vs.VideoNode, ref: Optional[vs.VideoNode], d: int, a: int, h: float, gpuid: int) -> vs.VideoNode:
     if ref and ref.format != clip.format:
         ref = ref.resize.Bicubic(format=clip.format)
-    opp = opp and ClipSampling(clip) == "444"
     src = clip
     sample = 1 if clip.format.bits_per_sample == 32 else 0
-    if opp:
-        clip = YUV2YCC(clip, sample)
-        if ref:
-            ref = YUV2YCC(ref, sample)
 
     device = dict(device_type="auto" if gpuid >= 0 else "cpu", device_id=max(0, gpuid))
     if clip.format.color_family == vs.GRAY:
@@ -420,24 +440,7 @@ def KnlMeans(clip: vs.VideoNode, ref: Optional[vs.VideoNode], d: int, a: int, h:
         clean = clip.knlm.KNLMeansCL(d=d, a=a, h=h, channels="Y", rclip=ref, **device)
         uv = clip.knlm.KNLMeansCL(d=d, a=a, h=h/2, channels="UV", rclip=ref, **device)
         output = core.std.ShufflePlanes(clips=[clean, uv], planes=[0, 1, 2], colorfamily=vs.YUV)
-    return YCC2YUV(output, src) if opp else output
-
-
-def ConvertToM(c: vs.VideoNode, src: vs.VideoNode, m: int) -> vs.VideoNode:
-    if src.format.color_family == vs.GRAY:
-        fmt = vs.GRAY32 if m == 4 else vs.GRAY16 if m == 3 or m == 2 else vs.GRAY8
-    else:
-        samp = ClipSampling(c)
-        fmt = vs.YUV444PS if m == 4 else vs.YUV444P16 if m == 3 else vs.YUV420P16 if samp == "420" else vs.YUV422P16 if samp == "422" else vs.YUV444P16
-    if c.format == fmt:
-        return c
-    elif c.format.color_family in [vs.YUV, vs.GRAY]:
-        return c.resize.Bicubic(format=fmt)
-    else:
-        # Convert back while respecting ColorRange, Matrix, ChromaLocation, Transfer and Primaries. Note that setting range=1 sets _ColorRange=0 (reverse)
-        # transfer = GetTransfer(src)
-        # primaries = GetPrimaries(src)
-        return c.resize.Bicubic(format=fmt, matrix=GetMatrix(src), chromaloc=GetChromaLoc(src), range=1 if GetColorRange(src) == 0 else 0)
+    return output
 
 
 # Adjusts brightness and contrast
@@ -457,7 +460,7 @@ def Tweak(clip: vs.VideoNode, bright: float = None, cont: float = None) -> vs.Vi
 
         if isFLOAT:
             expr = "x {} * {} + 0.0 max 1.0 min".format(cont, bright)
-            clip =  core.akarin.Expr([clip], [expr] if isGRAY else [expr, ''])
+            clip =  core.std.Expr([clip], [expr] if isGRAY else [expr, ''])
         else:
             luma_lut = []
             luma_min = 16  << (bd - 8) if not fulls else 0
@@ -502,25 +505,24 @@ def Sharpen(clip: vs.VideoNode, amountH: float = 1.0, amountV: Optional[float] =
     return clip
 
 
-def ClipSampling(clip: vs.VideoNode) -> str:
-    return "GRAY" if clip.format.color_family == vs.GRAY else \
-            "RGB" if clip.format.color_family == vs.RGB else \
-            ("444" if clip.format.subsampling_w == 0 and clip.format.subsampling_h == 0 else \
-            "422" if clip.format.subsampling_w == 1 and clip.format.subsampling_h == 0 else "420") \
-            if clip.format.color_family == vs.YUV else "UNKNOWN"
-
-
-# Point resize is 1.5x faster BUT fmtc requires less memory
+# Point resize is 1.5x faster than fmtc
 def ConvertBits(c: vs.VideoNode, bits: int = 8, fulls: bool = False, dither: bool = False):
+    if c.format.bits_per_sample == bits:
+        return c
     return c.fmtc.bitdepth(bits=bits, fulls=fulls, fulld=fulls, dmode=0 if dither else 1)
-    samp = ClipSampling(c)
+    fmt = GetFormat(ClipSampling(c), bits)    
+    range = 1 if fulls else 0
+    return c.resize.Point(format=fmt, dither_type="ordered" if dither else "none", range=range, range_in=range)
+
+
+def GetFormat(samp: str, bits: int) -> int:
     i = 0 if bits==8 else 1 if bits==10 else 2 if bits==12 else 3 if bits==14 else 4 if bits==16 else 5 if bits==32 else -1
     if i == -1:
-        raise ValueError("ConvertBits: outbits must be 8, 10, 12, 14, 16 or 32")
+        raise ValueError("GetFormat: bits must be 8, 10, 12, 14, 16 or 32")
 
     fmt = 0
     if samp == "GRAY":
-        fmt = [vs.GRAY8, vs.GRAY10, vs.GRAY12, vs.GRAY14, vs.GRAY16, vs.GRAY32] [i]
+        fmt = [vs.GRAY8, vs.GRAY10, vs.GRAY12, vs.GRAY14, vs.GRAY16, vs.GRAYS] [i]
     elif samp == "RGB":
         fmt = [vs.RGB24, 0, 0, 0, vs.RGB48, vs.RGBS] [i]
     elif samp == "444":
@@ -530,10 +532,16 @@ def ConvertBits(c: vs.VideoNode, bits: int = 8, fulls: bool = False, dither: boo
     elif samp == "420":
         fmt = [vs.YUV420P8, vs.YUV420P10, vs.YUV420P12, vs.YUV420P14, vs.YUV420P16, 0] [i]
     if fmt == 0:
-        raise ValueError(f"ConvertBits: Invalid bitdepth ({bits}) for format ({samp})")
-    
-    range = 1 if fulls else 0
-    return c.resize.Point(format=fmt, dither_type="ordered" if dither else "none", range=range, range_in=range)
+        raise ValueError(f"GetFormat: Invalid bitdepth ({bits}) for format ({samp})")
+    return fmt
+
+
+def ClipSampling(clip: vs.VideoNode) -> str:
+    return "GRAY" if clip.format.color_family == vs.GRAY else \
+            "RGB" if clip.format.color_family == vs.RGB else \
+            ("444" if clip.format.subsampling_w == 0 and clip.format.subsampling_h == 0 else \
+            "422" if clip.format.subsampling_w == 1 and clip.format.subsampling_h == 0 else "420") \
+            if clip.format.color_family == vs.YUV else "UNKNOWN"
 
 
 # Get frame properties
@@ -542,9 +550,11 @@ def GetFrameProp(c: vs.VideoNode, name: str, default):
     return props[name] if name in props else default
 
 def GetColorRange(c: vs.VideoNode) -> int:
-    return GetFrameProp(c, "_ColorRange", 1)
+    return 0 if c.format.color_family == vs.RGB else GetFrameProp(c, "_ColorRange", 1)
 
 def GetMatrix(c: vs.VideoNode) -> int:
+    if c.format.color_family == vs.RGB:
+        return 0
     matrix = GetFrameProp(c, "_Matrix", 1)
     return 6 if matrix in [0, 2] else matrix
 
@@ -559,30 +569,6 @@ def GetPrimaries(c: vs.VideoNode) -> int:
 def GetChromaLoc(c: vs.VideoNode) -> int:
     return GetFrameProp(c, "_ChromaLocation", 0)
 
-def YUV2OPP(clip: vs.VideoNode, sample: int = 0):
-    fulls = GetColorRange(clip) == 0
-    clip = clip.resize.Bicubic(format = vs.RGBS if sample > 0 else vs.RGB48, matrix_in=GetMatrix(clip))
-    clip = RGB_to_OPP(clip, fulls)
-    return clip.std.SetFrameProp(prop='_Matrix', intval=2)
-
-def OPP2YUV(clip: vs.VideoNode, src: vs.VideoNode, format: Optional[int] = None):
-    fulls = GetColorRange(src) == 0
-    format = format if format != None else src.format
-    clip = OPP_to_RGB(clip, fulls)
-    return clip.resize.Bicubic(format=format, matrix=GetMatrix(src), chromaloc=GetChromaLoc(src), range=1 if fulls else 0)
-
-def YUV2YCC(clip: vs.VideoNode, sample: int = 0):
-    fulls = GetColorRange(clip) == 0
-    clip = clip.resize.Bicubic(format = vs.RGBS if sample > 0 else vs.RGB48, matrix_in=GetMatrix(clip))
-    clip = RGB_to_YCgCoR(clip, fulls)
-    return clip.std.SetFrameProp(prop='_Matrix', intval=2)
-
-def YCC2YUV(clip: vs.VideoNode, src: vs.VideoNode, format: Optional[int] = None):
-    fulls = GetColorRange(src) == 0
-    format = format if format != None else src.format
-    clip = YCgCoR_to_RGB(clip, fulls)
-    return clip.resize.Bicubic(format=format, matrix=GetMatrix(src), chromaloc=GetChromaLoc(src), range=1 if fulls else 0)
-
 
 # RGB to YCgCo RCT function
 def RGB_to_YCgCoR (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
@@ -594,11 +580,12 @@ def RGB_to_YCgCoR (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
     G = core.std.ShufflePlanes(c, [1], vs.GRAY)
     B = core.std.ShufflePlanes(c, [2], vs.GRAY)
 
-    Co = core.akarin.Expr([R,      B], ex_dlut("x 0.5  * y 0.5  * - range_half +",                bd, fulls))
-    Cg = core.akarin.Expr([Co, G,  B], ex_dlut("y z x range_half - 0.5 * + - 0.5 * range_half +", bd, fulls))
-    Y  = core.akarin.Expr([Co, Cg, B], ex_dlut("z x range_half - 0.5 * + y range_half - +",       bd, fulls))
+    Co = core.std.Expr([R,      B], ex_dlut("x 0.5  * y 0.5  * - range_half +",                bd, fulls))
+    Cg = core.std.Expr([Co, G,  B], ex_dlut("y z x range_half - 0.5 * + - 0.5 * range_half +", bd, fulls))
+    Y  = core.std.Expr([Co, Cg, B], ex_dlut("z x range_half - 0.5 * + y range_half - +",       bd, fulls))
 
-    return core.std.ShufflePlanes([Y, Cg, Co], [0, 0, 0], vs.YUV)
+    output = core.std.ShufflePlanes([Y, Cg, Co], [0, 0, 0], vs.YUV)
+    return output.std.SetFrameProp(prop='_Matrix', intval=2)
 
 
 #  YCgCo RCT to RGB function
@@ -612,10 +599,11 @@ def YCgCoR_to_RGB (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
     Co = core.std.ShufflePlanes(c, [2], vs.GRAY)
 
     G = core.akarin.Expr([Y, Cg    ], ex_dlut("y range_half - dup yvar! 2 * x yvar@ - +",             bd, fulls))
-    B = core.akarin.Expr([Y, Cg, Co], ex_dlut("x y range_half - - z range_half - 0.5 * -", bd, fulls))
-    R = core.akarin.Expr([Co, B    ], ex_dlut("y x range_half - 2 * +",                    bd, fulls))
+    B = core.std.Expr([Y, Cg, Co], ex_dlut("x y range_half - - z range_half - 0.5 * -", bd, fulls))
+    R = core.std.Expr([Co, B    ], ex_dlut("y x range_half - 2 * +",                    bd, fulls))
 
-    return core.std.ShufflePlanes([R, G, B], [0, 0, 0], vs.RGB)
+    output = core.std.ShufflePlanes([R, G, B], [0, 0, 0], vs.RGB)
+    return output.std.SetFrameProp(prop='_Matrix', intval=0)
 
 
 def RGB_to_OPP (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
@@ -629,11 +617,12 @@ def RGB_to_OPP (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
 
     b32 = "" if bd == 32 else "range_half +"
 
-    O  = core.akarin.Expr([R, G, B], ex_dlut("x y z + + 0.333333333 *",     bd, fulls))
-    P1 = core.akarin.Expr([R,    B], ex_dlut("x y - 0.5 * "+b32,            bd, fulls))
-    P2 = core.akarin.Expr([R, G, B], ex_dlut("x z + 0.25 * y 0.5 * - "+b32, bd, fulls))
+    O  = core.std.Expr([R, G, B], ex_dlut("x y z + + 0.333333333 *",     bd, fulls))
+    P1 = core.std.Expr([R,    B], ex_dlut("x y - 0.5 * "+b32,            bd, fulls))
+    P2 = core.std.Expr([R, G, B], ex_dlut("x z + 0.25 * y 0.5 * - "+b32, bd, fulls))
 
-    return core.std.ShufflePlanes([O, P1, P2], [0, 0, 0], vs.YUV)
+    output = core.std.ShufflePlanes([O, P1, P2], [0, 0, 0], vs.YUV)
+    return output.std.SetFrameProp(prop='_Matrix', intval=2)
 
 
 def OPP_to_RGB (c: vs.VideoNode, fulls: bool = False):
@@ -647,17 +636,18 @@ def OPP_to_RGB (c: vs.VideoNode, fulls: bool = False):
 
     b32 = "" if bd == 32 else "range_half -"
 
-    R = core.akarin.Expr([O, P1, P2], ex_dlut("x y "+b32+" + z "+b32+" 0.666666666 * +", bd, fulls))
-    G = core.akarin.Expr([O,     P2], ex_dlut("x y "+b32+" 1.333333333 * -",             bd, fulls))
-    B = core.akarin.Expr([O, P1, P2], ex_dlut("x z "+b32+" 0.666666666 * + y "+b32+" -", bd, fulls))
+    R = core.std.Expr([O, P1, P2], ex_dlut("x y "+b32+" + z "+b32+" 0.666666666 * +", bd, fulls))
+    G = core.std.Expr([O,     P2], ex_dlut("x y "+b32+" 1.333333333 * -",             bd, fulls))
+    B = core.std.Expr([O, P1, P2], ex_dlut("x z "+b32+" 0.666666666 * + y "+b32+" -", bd, fulls))
 
-    return core.std.ShufflePlanes([R, G, B], [0, 0, 0], vs.RGB)
+    output = core.std.ShufflePlanes([R, G, B], [0, 0, 0], vs.RGB)
+    return output.std.SetFrameProp(prop='_Matrix', intval=0)
+
 
 # HBD constants 3D look up table
 #
 # * YUV and RGB mid-grey is 127.5 (rounded to 128) for PC range levels,
 #   this translates to a value of 125.5 in TV range levels. Chroma is always centered, so 128 regardless.
-
 def ex_dlut(expr: str = "", bits: int = 8, fulls: bool = False) -> str:
     bitd = \
         0 if bits == 8 else \
@@ -704,3 +694,27 @@ def ex_dlut(expr: str = "", bits: int = 8, fulls: bool = False) -> str:
     expr = expr.replace("range_max",               str(range_max[fs]))
     expr = expr.replace("range_size",              str(range_size[fs]))
     return expr
+
+
+# feisty2's ChromaReconstructor_faster v3.0 HBD mod
+def ChromaReconstructor(clip: vs.VideoNode, gpuid: int = 0):
+    fulls = GetColorRange(clip) == 0
+    w = clip.width
+    h = clip.height
+    Y = core.std.ShufflePlanes(clip, [0], vs.GRAY)
+    Uor = core.std.ShufflePlanes(clip, [1], vs.GRAY)
+    Vor = core.std.ShufflePlanes(clip, [2], vs.GRAY)
+    device = dict(device_type="auto" if gpuid >= 0 else "cpu", device_id=max(0, gpuid))
+    nparams = dict(nns=1, qual=1, etype=1, nsize=0, fulls=fulls, fulld=fulls, \
+        target_width=w*2, target_height=h*2, kernel="Bicubic", a1=0.0, a2=0.75, \
+        mode="nnedi3cl" if gpuid >= 0 else "znedi3", device=max(0, gpuid))
+
+    ref     = Y.knlm.KNLMeansCL(0, 16, 0, pow(1.464968620512209618455732713658, 6.4), wref=1, **device)
+    Luma    = nnedi3.nnedi3_resample(ref, **nparams)
+    Uu      = nnedi3.nnedi3_resample(Uor, **nparams)
+    Vu      = nnedi3.nnedi3_resample(Vor, **nparams)
+    Unew    = Uu.knlm.KNLMeansCL(0, 16, 0, 6.4, wref=0, rclip=Luma, **device).resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)
+    Vnew    = Vu.knlm.KNLMeansCL(0, 16, 0, 6.4, wref=0, rclip=Luma, **device).resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)
+    U       = core.std.MergeDiff(Unew, core.std.MakeDiff(Unew.std.Convolution(matrix=[1, 1, 1, 1, 0, 1, 1, 1, 1]), Uu.resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)))
+    V       = core.std.MergeDiff(Vnew, core.std.MakeDiff(Vnew.std.Convolution(matrix=[1, 1, 1, 1, 0, 1, 1, 1, 1]), Vu.resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)))
+    return core.std.ShufflePlanes([Y, U, V], [0, 0, 0], vs.YUV)

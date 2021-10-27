@@ -6,7 +6,7 @@ import nnedi3_resample as nnedi3
 
 """
 xClean 3-pass denoiser
-beta 6 (2021-10-24) by Etienne Charland
+beta 7 (2021-10-27) by Etienne Charland
 Supported formats: YUV, RGB, GRAY
 Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian, knlm, bm3d, bm3dcuda_rtc, bm3dcpu, neo_f3kdb, akarin, nnedi3_resample, nnedi3cl
 

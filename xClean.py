@@ -1,4 +1,4 @@
-from vapoursynth import RGB, ColorFamily, core
+from vapoursynth import core
 import vapoursynth as vs
 import math
 from typing import Optional
@@ -696,7 +696,7 @@ def ex_dlut(expr: str = "", bits: int = 8, fulls: bool = False) -> str:
     return expr
 
 
-# feisty2's ChromaReconstructor_faster v3.0 HBD mod
+# feisty2's ChromaReconstructor_faster v3.0 HBD mod by DogWay
 def ChromaReconstructor(clip: vs.VideoNode, gpuid: int = 0):
     fulls = GetColorRange(clip) == 0
     w = clip.width

@@ -212,7 +212,7 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         core.resize.Bicubic(clip, format=vs.YUV444P16, filter_param_a_uv=0, filter_param_b_uv=.5)
     c16 = cchroma.resize.Bicubic(format=vs.RGB48 if conv else vs.YUV444P16, matrix_in=GetMatrix(clip)) if not isGray else ConvertBits(clip, 16, fulls, True)
     c32 = ConvertBits(c16, 32, fulls, False)
-    c8 = ConvertBits(c16, 8, fulls, False)
+    c8 = ConvertBits(c16, 8, fulls, True)
     output = None
 
     # Apply MVTools
@@ -234,8 +234,7 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         m2o = max(2, max(m2, m3))
         c2 = c32 if m2o==3 else c16
         ref = RGB_to_OPP(YCgCoR_to_RGB(output, fulls), fulls) if output and conv else output if output else None
-        ref = ref.resize.Spline36((width * m2r)//4*4, (height * m2r)//4*4, format = GetFormat(ClipSampling(ref), 32)) if ref else None
-        #ref = ConvertBits(ref, 32, fulls, False) if ref else None
+        ref = ref.resize.Spline36((width * m2r)//4*4, (height * m2r)//4*4, format = vs.YUV444PS) if ref else None
         c2r = c2.resize.Bicubic((width * m2r)//4*4, (height * m2r)//4*4, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.5, filter_param_b_uv=.5) if m2r < 1 else c2
         c2r = ConvertBits(RGB_to_OPP(c2r, fulls) if conv else c2r, 32, fulls, False)
 
@@ -272,7 +271,7 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
     
     # Apply deband
     if deband:
-        if output.format.bits_per_sample == 32:
+        if output.format.bits_per_sample > 16:
             output = ConvertBits(output, 16, fulls, False)
         output = output.neo_f3kdb.Deband(range=16, preset="high" if dochroma else "luma", grainy=defH/15, grainc=defH/16 if dochroma else 0)
 

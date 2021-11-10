@@ -161,9 +161,6 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         dmode: int = 0, rgmode: int = 18, thsad: int = 400, d: int = 2, a: int = 2, h: float = 1.4, gpuid: int = 0, gpucuda: Optional[int] = None, sigma: float = 9, 
         block_step: int = 4, bm_range: int = 16, ps_range: int = 8, radius: int = 0, bm3d_fast: bool = False, conv: bool = True, downchroma: bool = None) -> vs.VideoNode:
 
-    # if not clip.format.color_family in [vs.YUV, vs.GRAY]:
-    #     raise TypeError("xClean: Only YUV or GRAY clips are supported")
-
     width = clip.width
     height = clip.height
     defH = max(height, width // 4 * 3) # Resolution calculation for auto blksize settings
@@ -201,18 +198,21 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
     gpucuda = gpucuda if gpucuda != None else gpuid
     bd = clip.format.bits_per_sample
     fulls = GetColorRange(clip) == 0
+    matrix = GetMatrix(clip)
     outbits = outbits or bd
-    if not outbits in [8, 10, 12, 14, 16, 32]:
-        raise ValueError("xClean: outbits must be 8, 10, 12, 14, 16 or 32")
-    
+    if not outbits in [8, 9, 10, 12, 14, 16, 32]:
+        raise ValueError("xClean: outbits must be 8, 9, 10, 12, 14, 16 or 32")
+    cplace = ["left", "center", "top_left", "left", "left", "left"] [GetChromaLoc(clip)]
+
     # Reference clips are in RGB or GRAY format, to allow converting to desired formats
-    cchroma = clip if samp in ["444", "RGB"] else \
+    cconv = clip if samp in ["444", "RGB", "GRAY"] else \
         ChromaReconstructor(clip, gpuid) if chroma == "reconstructor" else \
-        nnedi3.nnedi3_resample(clip, fulls=fulls, fulld=fulls, csp=vs.YUV444P16, mode="nnedi3cl" if gpuid >= 0 else "znedi3", device=max(0, gpuid)) if chroma == "nnedi3" else \
-        core.resize.Bicubic(clip, format=vs.YUV444P16, filter_param_a_uv=0, filter_param_b_uv=.5)
-    c16 = cchroma.resize.Bicubic(format=vs.RGB48 if conv else vs.YUV444P16, matrix_in=GetMatrix(clip)) if not isGray else ConvertBits(clip, 16, fulls, True)
-    c32 = ConvertBits(c16, 32, fulls, False)
-    c8 = ConvertBits(c16, 8, fulls, True)
+        nnedi3.nnedi3_resample(clip, csp=vs.YUV444P16 if bd < 32 else vs.YUV444PS, mode="nnedi3cl" if gpuid >= 0 else "znedi3", device=max(0, gpuid), fulls=fulls, fulld=fulls) if chroma == "nnedi3" else \
+        core.fmtc.resample(clip, csp=vs.YUV444P16 if bd < 32 else vs.YUV444PS, kernel="bicubic", a1=0, a2=.5, fulls=fulls, fulld=fulls, cplace=cplace)
+    cconv = ConvertMatrix(cconv, vs.RGB, fulls) if conv and clip.format.color_family == vs.YUV else clip
+    c32 = ConvertBits(cconv, 32, fulls, False)
+    c16 = ConvertBits(cconv, 16, fulls, True)
+    c8 = ConvertBits(cconv, 8, fulls, True)
     output = None
 
     # Apply MVTools
@@ -234,8 +234,8 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         m2o = max(2, max(m2, m3))
         c2 = c32 if m2o==3 else c16
         ref = RGB_to_OPP(YCgCoR_to_RGB(output, fulls), fulls) if output and conv else output if output else None
-        ref = ref.resize.Spline36((width * m2r)//4*4, (height * m2r)//4*4, format = vs.YUV444PS) if ref else None
-        c2r = c2.resize.Bicubic((width * m2r)//4*4, (height * m2r)//4*4, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.5, filter_param_b_uv=.5) if m2r < 1 else c2
+        ref = ref.fmtc.resample((width * m2r)//4*4, (height * m2r)//4*4, csp = vs.GRAYS if isGray else vs.YUV444PS, kernel = "spline36") if ref else None
+        c2r = c2.fmtc.resample((width * m2r)//4*4, (height * m2r)//4*4, kernel = "bicubic", a1=0, a2=0.5) if m2r < 1 else c2
         c2r = ConvertBits(RGB_to_OPP(c2r, fulls) if conv else c2r, 32, fulls, False)
 
         output = BM3D(c2r, ref, sigma, gpucuda, block_step, bm_range, ps_range, radius, bm3d_fast)
@@ -243,13 +243,13 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         output = ConvertBits(output, c2.format.bits_per_sample, fulls, False)
         output = RGB_to_YCgCoR(OPP_to_RGB(output, fulls), fulls) if conv else output
         c2 = RGB_to_YCgCoR(c2, fulls) if conv else c2
-        output = output.resize.Spline36(width, height) if m2r < 1 else output
+        output = output.fmtc.resample(width, height, kernel = "spline36") if m2r < 1 else output
         sharp2 = max(0, min(20, sharp + (1 - m2r) * .95))
         output = PostProcessing(output, c2, defH, strength, sharp2, rn, rgmode, 1)
         # output in YCgCoR format
 
     if output and output.height < height:
-        output = output.resize.Spline36(width, height)
+        output = output.fmtc.resample(width, height, kernel = "spline36")
 
     # Apply KNLMeans
     if m3 > 0:
@@ -277,8 +277,10 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
 
     # Convert to desired output format and bitrate
     output = YCgCoR_to_RGB(output, fulls) if conv else output
-    fmt = GetFormat(samp if samp=="RGB" or downchroma else "444", output.format.bits_per_sample)
-    output = output.resize.Bicubic(format=fmt, matrix=GetMatrix(clip), chromaloc=GetChromaLoc(clip), range=1 if fulls else 0, filter_param_a_uv=0, filter_param_b_uv=.5)
+    if clip.format.color_family == vs.YUV:
+        output = ConvertMatrix(output, vs.YUV, fulls, matrix)
+        if downchroma and samp != "444":
+            output = output.fmtc.resample(css=samp, cplace=cplace, fulls=fulls, fulld=fulls, kernel="bicubic", a1=0, a2=0.5)
     if output.format.bits_per_sample != outbits:
         output = output.fmtc.bitdepth(bits=outbits, fulls=fulls, fulld=fulls, dmode=dmode)
      
@@ -509,30 +511,18 @@ def ConvertBits(c: vs.VideoNode, bits: int = 8, fulls: bool = False, dither: boo
     if c.format.bits_per_sample == bits:
         return c
     return c.fmtc.bitdepth(bits=bits, fulls=fulls, fulld=fulls, dmode=0 if dither else 1)
-    fmt = GetFormat(ClipSampling(c), bits)    
+    fmt = GetFormat(c, bits, c.format.subsampling_w, c.format.subsampling_h)
     range = 1 if fulls else 0
     return c.resize.Point(format=fmt, dither_type="ordered" if dither else "none", range=range, range_in=range)
 
 
-def GetFormat(samp: str, bits: int) -> int:
-    i = 0 if bits==8 else 1 if bits==10 else 2 if bits==12 else 3 if bits==14 else 4 if bits==16 else 5 if bits==32 else -1
-    if i == -1:
-        raise ValueError("GetFormat: bits must be 8, 10, 12, 14, 16 or 32")
-
-    fmt = 0
-    if samp == "GRAY":
-        fmt = [vs.GRAY8, vs.GRAY10, vs.GRAY12, vs.GRAY14, vs.GRAY16, vs.GRAYS] [i]
-    elif samp == "RGB":
-        fmt = [vs.RGB24, 0, 0, 0, vs.RGB48, vs.RGBS] [i]
-    elif samp == "444":
-        fmt = [vs.YUV444P8, vs.YUV444P10, vs.YUV444P12, vs.YUV444P14, vs.YUV444P16, vs.YUV444PS] [i]
-    elif samp == "422":
-        fmt = [vs.YUV422P8, vs.YUV422P10, vs.YUV422P12, vs.YUV422P14, vs.YUV422P16, 0] [i]
-    elif samp == "420":
-        fmt = [vs.YUV420P8, vs.YUV420P10, vs.YUV420P12, vs.YUV420P14, vs.YUV420P16, 0] [i]
-    if fmt == 0:
-        raise ValueError(f"GetFormat: Invalid bitdepth ({bits}) for format ({samp})")
-    return fmt
+def GetFormat(color_family: int, bits: int, sampw: int = 0, samph: int = 0):
+    return core.query_video_format(
+                            color_family    = color_family,
+                            sample_type     = vs.FLOAT if bits==32 else vs.INTEGER,
+                            bits_per_sample = bits,
+                            subsampling_w   = sampw,
+                            subsampling_h   = samph)
 
 
 def ClipSampling(clip: vs.VideoNode) -> str:
@@ -567,6 +557,19 @@ def GetPrimaries(c: vs.VideoNode) -> int:
 
 def GetChromaLoc(c: vs.VideoNode) -> int:
     return GetFrameProp(c, "_ChromaLocation", 0)
+
+
+# Converts matrix into desired format. If matrix is not specified, it will read matrix from source frame property.
+def ConvertMatrix(c: vs.VideoNode, col_fam: int, fulls: bool, matrix: Optional[int] = None):
+    matrix = matrix if matrix != None else GetMatrix(c)
+    csp = GetFormat(col_fam, c.format.bits_per_sample)
+    if matrix == 10:
+        return c.fmtc.matrix2020cl(csp=csp, full=fulls)
+    else:
+        mat = ["RGB", "709", "601", None, "FCC", "601", "601", "240", "YCgCo", "2020", None, None, None, None] [matrix]
+        if mat == None:
+            raise ValueError(f"ConvertMatrix: matrix {matrix} is not supported.")
+        return c.fmtc.matrix(csp=csp, mat=mat, fulls=fulls, fulld=fulls)
 
 
 # RGB to YCgCo RCT function

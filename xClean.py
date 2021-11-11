@@ -6,7 +6,7 @@ import nnedi3_resample as nnedi3
 
 """
 xClean 3-pass denoiser
-beta 7 (2021-10-27) by Etienne Charland
+beta 8 (2021-11-10) by Etienne Charland
 Supported formats: YUV, RGB, GRAY
 Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian, knlm, bm3d, bm3dcuda_rtc, bm3dcpu, neo_f3kdb, akarin, nnedi3_resample, nnedi3cl
 
@@ -205,11 +205,12 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
     cplace = ["left", "center", "top_left", "left", "left", "left"] [GetChromaLoc(clip)]
 
     # Reference clips are in RGB or GRAY format, to allow converting to desired formats
-    cconv = clip if samp in ["444", "RGB", "GRAY"] else \
-        ChromaReconstructor(clip, gpuid) if chroma == "reconstructor" else \
-        nnedi3.nnedi3_resample(clip, csp=vs.YUV444P16 if bd < 32 else vs.YUV444PS, mode="nnedi3cl" if gpuid >= 0 else "znedi3", device=max(0, gpuid), fulls=fulls, fulld=fulls) if chroma == "nnedi3" else \
-        core.fmtc.resample(clip, csp=vs.YUV444P16 if bd < 32 else vs.YUV444PS, kernel="bicubic", a1=0, a2=.5, fulls=fulls, fulld=fulls, cplace=cplace)
-    cconv = ConvertMatrix(cconv, vs.RGB, fulls) if conv and clip.format.color_family == vs.YUV else clip
+    cconv = ConvertBits(clip, 16, fulls, True) if bd < 16 else clip
+    cconv = cconv if samp in ["444", "RGB", "GRAY"] else \
+        ChromaReconstructor(cconv, gpuid) if chroma == "reconstructor" else \
+        nnedi3.nnedi3_resample(cconv, csp=vs.YUV444P16 if bd < 32 else vs.YUV444PS, mode="nnedi3cl" if gpuid >= 0 else "znedi3", device=max(0, gpuid), fulls=fulls, fulld=fulls) if chroma == "nnedi3" else \
+        core.fmtc.resample(cconv, csp=vs.YUV444P16 if bd < 32 else vs.YUV444PS, kernel="bicubic", a1=0, a2=.5, fulls=fulls, fulld=fulls, cplace=cplace)
+    cconv = ConvertMatrix(cconv, vs.RGB, fulls) if conv and clip.format.color_family == vs.YUV else cconv
     c32 = ConvertBits(cconv, 32, fulls, False)
     c16 = ConvertBits(cconv, 16, fulls, True)
     c8 = ConvertBits(cconv, 8, fulls, True)
@@ -220,7 +221,7 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         m1r = 1 if m1 == int(m1) else m1 % 1 # Decimal point is resize factor
         m1 = int(m1)
         c1 = c32 if m1 == 3 else c16 if m1 == 2 else c8
-        c1 = c1.resize.Bicubic((width * m1r)//4*4, (height * m1r)//4*4, filter_param_a=0, filter_param_a_uv=0, filter_param_b=.75, filter_param_b_uv=.75) if m1r < 1 else c1
+        c1 = c1.fmtc.resample((width * m1r)//4*4, (height * m1r)//4*4, kernel="bicubic", a1=0, a2=.75) if m1r < 1 else c1
         c1 = RGB_to_YCgCoR(c1, fulls) if conv else c1
         output = MvTools(c1, defH, thsad)
         sharp1 = max(0, min(20, sharp + (1 - m1r) * .35))
@@ -427,10 +428,14 @@ def BM3D(clip: vs.VideoNode, ref: Optional[vs.VideoNode], sigma: float, gpuid: i
 
 # KnlMeansCL denoising method, useful for dark noisy scenes
 def KnlMeans(clip: vs.VideoNode, ref: Optional[vs.VideoNode], d: int, a: int, h: float, gpuid: int) -> vs.VideoNode:
-    if ref and ref.format != clip.format:
-        ref = ref.resize.Bicubic(format=clip.format)
+    #if ref and ref.format != clip.format:
+    #    ref = ref.resize.Bicubic(format=clip.format)
+    bd = clip.format.bits_per_sample
+    fulls = GetColorRange(clip) == 0
+    if ref and ref.format.bits_per_sample != bd:
+        ref = ConvertBits(ref, bd, fulls, True)
     src = clip
-    sample = 1 if clip.format.bits_per_sample == 32 else 0
+    sample = 1 if bd == 32 else 0
 
     device = dict(device_type="auto" if gpuid >= 0 else "cpu", device_id=max(0, gpuid))
     if clip.format.color_family == vs.GRAY:
@@ -511,9 +516,6 @@ def ConvertBits(c: vs.VideoNode, bits: int = 8, fulls: bool = False, dither: boo
     if c.format.bits_per_sample == bits:
         return c
     return c.fmtc.bitdepth(bits=bits, fulls=fulls, fulld=fulls, dmode=0 if dither else 1)
-    fmt = GetFormat(c, bits, c.format.subsampling_w, c.format.subsampling_h)
-    range = 1 if fulls else 0
-    return c.resize.Point(format=fmt, dither_type="ordered" if dither else "none", range=range, range_in=range)
 
 
 def GetFormat(color_family: int, bits: int, sampw: int = 0, samph: int = 0):
@@ -715,8 +717,8 @@ def ChromaReconstructor(clip: vs.VideoNode, gpuid: int = 0):
     Luma    = nnedi3.nnedi3_resample(ref, **nparams)
     Uu      = nnedi3.nnedi3_resample(Uor, **nparams)
     Vu      = nnedi3.nnedi3_resample(Vor, **nparams)
-    Unew    = Uu.knlm.KNLMeansCL(0, 16, 0, 6.4, wref=0, rclip=Luma, **device).resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)
-    Vnew    = Vu.knlm.KNLMeansCL(0, 16, 0, 6.4, wref=0, rclip=Luma, **device).resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)
-    U       = core.std.MergeDiff(Unew, core.std.MakeDiff(Unew.std.Convolution(matrix=[1, 1, 1, 1, 0, 1, 1, 1, 1]), Uu.resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)))
-    V       = core.std.MergeDiff(Vnew, core.std.MakeDiff(Vnew.std.Convolution(matrix=[1, 1, 1, 1, 0, 1, 1, 1, 1]), Vu.resize.Bicubic(w, h, filter_param_a=-0.5, filter_param_b=0.25)))
+    Unew    = Uu.knlm.KNLMeansCL(0, 16, 0, 6.4, wref=0, rclip=Luma, **device).fmtc.resample(w, h, kernel="bicubic", a1=-0.5, a2=0.25)
+    Vnew    = Vu.knlm.KNLMeansCL(0, 16, 0, 6.4, wref=0, rclip=Luma, **device).fmtc.resample(w, h, kernel="bicubic", a1=-0.5, a2=0.25)
+    U       = core.std.MergeDiff(Unew, core.std.MakeDiff(Unew.std.Convolution(matrix=[1, 1, 1, 1, 0, 1, 1, 1, 1]), Uu.fmtc.resample(w, h, kernel="bicubic", a1=-0.5, a2=0.25)))
+    V       = core.std.MergeDiff(Vnew, core.std.MakeDiff(Vnew.std.Convolution(matrix=[1, 1, 1, 1, 0, 1, 1, 1, 1]), Vu.fmtc.resample(w, h, kernel="bicubic", a1=-0.5, a2=0.25)))
     return core.std.ShufflePlanes([Y, U, V], [0, 0, 0], vs.YUV)

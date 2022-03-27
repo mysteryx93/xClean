@@ -422,7 +422,7 @@ def BM3D(clip: vs.VideoNode, ref: Optional[vs.VideoNode], sigma: float, gpuid: i
         clean = core.bm3dcuda_rtc.BM3D(clip, ref, chroma=chroma, sigma=sigma, device_id=gpuid, fast=bm3d_fast, radius=radius, block_step=block_step, bm_range=bm_range, ps_range=ps_range)
     else:
         clean = core.bm3dcpu.BM3D(clip, ref, chroma=chroma, sigma=sigma, block_step=block_step, bm_range=bm_range, ps_range=ps_range, radius=radius)
-    clean = clean.bm3d.VAggregate(sample=0 if icalc else 1) if radius > 0 else clean
+    clean = clean.bm3d.VAggregate(sample=0 if icalc else 1, radius=radius) if radius > 0 else clean
     return clean
 
 

@@ -193,7 +193,7 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         chroma = "none"
         conv = False
     dochroma = chroma != "none" or samp == "RGB"
-    downchroma = downchroma or False if chroma == "reconstructor" else True
+    downchroma = downchroma if downchroma is not None else False if chroma == "reconstructor" else True
 
     gpucuda = gpucuda if gpucuda != None else gpuid
     bd = clip.format.bits_per_sample

@@ -2,7 +2,7 @@
 xClean 3-pass denoiser
 beta 8 (2021-11-10) by Etienne Charland
 Supported formats: YUV, RGB, Y
-Requires: MaskTools2, MvTools2, KNLMeansCL, BM3D, aWarpSharp2, Median, BM3DCUDA, fmtconv, neo_f3kdb, nnedi3, nnedi3_resize16
+Requires: MaskTools2, MvTools2, KNLMeansCL, BM3DCUDA, aWarpSharpMT, Median, fmtconv, neo_f3kdb, neo_tmedian, nnedi3, nnedi3_resize16, SysInfo, Dogway Extools/TransformsPack/ChromaReconstructor
 
 xClean runs MVTools -> BM3D -> KNLMeans in that order, passing the output of each pass as the ref of the next denoiser.
 
@@ -45,7 +45,7 @@ very noisy 720p WebCam footage has HUGE noise reduction while preserving a surpr
 
 The default settings are very tolerant to various types of clips.
 
-All processing is done in YUV444 format. When conv=True, processing is done in YCgCoR, and in OPP colorspace for BM3D.
+All processing is done in YUV444 format. When conv=True, processing is done in YCoCgR, and in OPP colorspace for BM3D.
 
 
 +++ Denoising Methods Overview +++
@@ -148,12 +148,12 @@ d = 2: KNLMeans temporal radius. Setting 3 can either slightly improve quality o
 a = 2: KNLMeans spacial radius.
 sigma = 9: BM3D strength.
 bm3d_fast = False. BM3D fast.
-conv = True. Whether to convert to OPP format for BM3D and YCgCoR for everything else. If false, it will process in standard YUV444.
+conv = True. Whether to convert to OPP format for BM3D and YCoCgR for everything else. If false, it will process in standard YUV444.
 #################################################  */
 
-function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deband", int "depth", int "strength", float "m1", int "m2", int "m3", int "outbits", \
+function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deband", int "depth", int "strength", float "m1", float "m2", int "m3", int "outbits", \
         int "dmode", int "rgmode", int "thsad", int "d", int "a", float "h", int "gpuid", int "gpucuda", float "sigma", \
-        int "block_step", int "bm_range", int "ps_range", bool "conv", bool "downchroma", bool "fulls")
+        int "block_step", int "bm_range", int "ps_range", int "radius", bool "bm3d_fast", bool "conv", bool "downchroma", bool "fulls")
 {
     current_frame = 0   # Allow reading frame properties of first frame
     width 		= clip.width
@@ -182,6 +182,8 @@ function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deb
     block_step  = Default(block_step, 4)
     bm_range    = Default(bm_range, 16)
     ps_range    = Default(ps_range, 8)
+    radius   = Default(radius, 0)
+    bm3d_fast = Default(bm3d_fast, False)
     conv		= Default(conv, True)
     fulls   	= Default(fulls, x_GetColorRange(clip) == 0)
 
@@ -198,9 +200,9 @@ function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deb
 
     uv = clip
 	clip = chroma == "none" ? clip.ExtractY() : clip
-    samp = ClipSampling(clip)
-    matrix = GetMatrix(clip)
-    cplace = Select(GetChromaLoc(clip), "left", "center", "top_left", "left", "left", "left")
+    samp = x_ClipSampling(clip)
+    matrix = x_GetMatrix(clip)
+    cplace = Select(x_GetChromaLoc(clip), "left", "center", "top_left", "left", "left", "left")
 
     if (clip.IsY)
     {
@@ -211,11 +213,12 @@ function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deb
     downchroma = Default(downchroma, chroma != "reconstructor")
     
     # Reference clips are in RGB or GRAY format, to allow converting to desired formats
-    cconv = clip.IsYV24 || clip.ISRGB || clip.IsY ? clip : \
-        chroma == "reconstructor" ? ChromaReconstructor(clip, gpuid) : \
-        chroma == "nnedi3" ? nnedi3_resize16(clip, tv_range=!fulls, output="YV24") : \
-        fmtc_resample(clip, csp=bd < 32 ? "YUV444P16" : "YUV444PS" , kernel="bicubic", a1=0, a2=.5)
-    cconv = conv && (cilp.IsYUV || clip.IsYUVA) ? cchroma.ConvertToRGB(matrix_in=GetMatrix(clip)) : clip
+    cconv = bd < 16 ? x_ConvertBits(clip, 16, fulls, True) : clip
+    cconv = clip.Is444 || clip.IsRGB || clip.IsY ? cconv : \
+        chroma == "reconstructor" ? ChromaReconstructor_faster(cconv, gpuid) : \
+        chroma == "nnedi3" ? nnedi3_resize16(cconv, tv_range=!fulls, output = bd < 32 ? "YUV444P16" : "YUV444PS") : \
+        fmtc_resample(clip, csp=bd < 32 ? "YUV444P16" : "YUV444PS" , kernel="bicubic", a1=0, a2=.5, fulls=fulls, fulld=fulls, cplace=cplace)
+    cconv = conv && (clip.IsYUV || clip.IsYUVA) ? x_ConvertMatrix(cconv, "RGB", fulls) : cconv
     c32 = x_ConvertBits(cconv, 32, fulls, False)
     c16 = x_ConvertBits(cconv, 16, fulls, True)
     c8 = x_ConvertBits(cconv, 8, fulls, True)
@@ -226,13 +229,13 @@ function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deb
     {
         m1r = m1 == int(m1) ? 1 : m1 - int(m1) # Decimal point is resize factor
         m1 = int(m1)
-        c1 = m1 == 3 ? c32 : m1 == 2 : c16 : c8
+        c1 = m1 == 3 ? c32 : m1 == 2 ? c16 : c8
         c1 = m1r < 1 ? c1.fmtc_resample(int(width * m1r)/4*4, int(height * m1r)/4*4, kernel="bicubic", a1=0, a2=.75) : c1
-        c1 = conv ? RGB_to_YCgCoR(c1, fulls) : c1
-        output = MvTools(c1, defH, thsad)
+        c1 = conv ? RGB_to_YCoCgR(c1) : c1
+        output = x_MvTools(c1, defH, thsad)
         sharp1 = max(0, min(20, sharp + (1 - m1r) * .35))
-        output = PostProcessing(output, c1, defH, strength, sharp1, rn, rgmode, 0)
-        # output in YCgCoR format
+        output = x_PostProcessing(output, c1, defH, strength, sharp1, rn, rgmode, 0)
+        # output in YCoCgR format
 	}
 
     # Apply BM3D
@@ -242,23 +245,23 @@ function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deb
         m2 = int(m2)
         m2o = max(2, max(m2, m3))
         c2 = m2o==3 ? c32 : c16
-        ref = output && conv ? RGB_to_OPP(YCgCoR_to_RGB(output, fulls), fulls) : output
-        ref = Defined(ref) ? x_ConvertBits(ref.fmtc_resample(int(width * m2r)//4*4, int(height * m2r)//4*4, kernel="spline36"), 32, fulls, False) : ref
-        c2r = m2r < 1 ? c2.fmtc_resample(int(width * m2r)//4*4, int(height * m2r)//4*4, kernel="bicubic", a1=0, a2=.5) : c2
-        c2r = x_ConvertBits(conv ? RGB_to_OPP(c2r, fulls) : c2r, 32, fulls, False)
+        ref = Defined(output) && conv ? RGB_to_OPP(YCoCgR_to_RGB(output)) : output
+        ref = Defined(ref) ? ref.fmtc_resample(int(width * m2r)/4*4, int(height * m2r)/4*4, csp = clip.IsY ? "GRAYS" : "YUV444PS", kernel="spline36") : ref
+        c2r = m2r < 1 ? c2.fmtc_resample(int(width * m2r)/4*4, int(height * m2r)/4*4, kernel="bicubic", a1=0, a2=.5) : c2
+        c2r = x_ConvertBits(conv ? RGB_to_OPP(c2r) : c2r, 32, fulls, False)
 
-        output = BM3D(c2r, ref, sigma, gpucuda, block_step, bm_range, ps_range, radius, bm3d_fast)
+        output = x_BM3D(c2r, ref, sigma, gpucuda, block_step, bm_range, ps_range, radius, bm3d_fast)
         
         output = x_ConvertBits(output, c2.BitsPerComponent, fulls, False)
-        output = conv ? RGB_to_YCgCoR(OPP_to_RGB(output, fulls), fulls) : output
-        c2 = conv ? RGB_to_YCgCoR(c2, fulls) : c2
+        output = conv ? RGB_to_YCoCgR(OPP_to_RGB(output)) : output
+        c2 = conv ? RGB_to_YCoCgR(c2) : c2
         output = m2r < 1 ? output.fmtc_resample(width, height, kernel="spline36") : output
         sharp2 = max(0, min(20, sharp + (1 - m2r) * .95))
-        output = PostProcessing(output, c2, defH, strength, sharp2, rn, rgmode, 1)
-        # output in YCgCoR format
+        output = x_PostProcessing(output, c2, defH, strength, sharp2, rn, rgmode, 1)
+        # output in YCoCgR format
 	}
 	
-    if (Defined(output) and output.height < height)
+    if (Defined(output) && output.height < height)
     {
         output = output.fmtc_resample(width, height, kernel="spline36")
 	}
@@ -268,13 +271,13 @@ function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deb
     {
         m3 = min(2, m3) # KNL internally computes in 16-bit
         c3 = m3==3 ? c32 : c16
-        c3 = conv ? RGB_to_YCgCoR(c3, fulls) : c3
-        ref = x_ConvertBits(output, c3.BitsPerComponent, fulls, False) if Defined(output) else Undefined()
-        output = KnlMeans(c3, ref, d, a, h, gpuid)
+        c3 = conv ? RGB_to_YCoCgR(c3) : c3
+        ref = Defined(output) ? x_ConvertBits(output, c3.BitsPerComponent, fulls, False) : output
+        output = x_KnlMeans(c3, ref, d, a, h, gpuid)
         # Adjust sharp based on h parameter.
         sharp3 = max(0, min(20, sharp - .5 + (h/2.8)))
-        output = PostProcessing(output, c3, defH, strength, sharp3, rn, rgmode, 2)
-        # output in YCgCoR format
+        output = x_PostProcessing(output, c3, defH, strength, sharp3, rn, rgmode, 2)
+        # output in YCoCgR format
     }    
 
     # Add Depth (thicken lines for anime)
@@ -282,7 +285,7 @@ function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deb
     {
 		depth2 = -depth*3
 		depth = depth*2
-		output = mt_adddiff(output, mt_makediff(awarpsharp2(output, depth=depth2, blur=3), awarpsharp2(output, depth=depth, blur=2)))
+		output = ex_AddDiff(output, ex_MakeDiff(awarpsharp2(output, depth=depth2, blur=3), awarpsharp2(output, depth=depth, blur=2)))
     }
     
     # Apply deband
@@ -293,119 +296,124 @@ function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deb
     }
 
     # Convert to desired output format and bitrate
-    output = conv ? YCgCoR_to_RGB(output, fulls) : output
+    output = conv ? YCoCgR_to_RGB(output) : output
     if (clip.IsYUV || clip.IsYUVA)
     {
-        output = ConvertMatrix(output, vs.YUV, fulls, matrix)
-        if (downchroma && !clip.IsYV24)
+        output = x_ConvertMatrix(output, "YUV", fulls, matrix)
+        if (downchroma && !clip.Is444)
         {
             output = output.fmtc_resample(css=samp, cplace=cplace, fulls=fulls, fulld=fulls, kernel="bicubic", a1=0, a2=0.5)
         }
     }
-    if (output.bits_per_component != outbits)
+    if (output.BitsPerComponent != outbits)
     {
         output = output.fmtc_bitdepth(bits=outbits, fulls=fulls, fulld=fulls, dmode=dmode)
     }
      
     # Merge source chroma planes if not processing chroma.
-    if (!dochroma && (uv.IsYUV || uv.IsYUVA)
+    if (!dochroma && (uv.IsYUV || uv.IsYUVA))
     {
-        uv = uv.bits_per_component != outbits ? x_ConvertBits(uv, outbits, fulls, True) : uv
-        output = MergeChroma(output, uv)
+        uv = uv.BitsPerComponent != outbits ? x_ConvertBits(uv, outbits, fulls, True) : uv
+        output = MergeLuma(uv, output)
     }
     
     return output
 }
 
 
-function x_PostProcessing(clip clean, clip "c", int "defH", int "strength", float "sharp", float "rn", int "rgmode", int "method", bool "fullrange")
+function x_PostProcessing(clip clean, clip "c", int "defH", int "strength", float "sharp", float "rn", int "rgmode", int "method")
 {
-    fulls = GetColorRange(c) == 0
-    if rgmode == 0:
-        sharp = rn = 0
+    fulls = x_GetColorRange(c) == 0
+    if (rgmode == 0)
+    {
+        sharp = 0
+        rn = 0
+    }
 
     # Run at least in 16-bit
-    if clean.format.bits_per_sample < 16:
-        clean = ConvertBits(clean, 16, fulls, False)
-    if c.format.bits_per_sample < 16:
-        c = ConvertBits(c, 16, fulls, False)
-    bd = clean.format.bits_per_sample
+    clean = clean.BitsPerComponent < 16 ? x_ConvertBits(clean, 16, fulls, False) : clean
+    c = c.BitsPerComponent < 16 ? x_ConvertBits(c, 16, fulls, False) : c
+    bd = clean.BitsPerComponent
     
     # Separate luma and chroma
     filt = clean
-    clean = core.std.ShufflePlanes(clean, [0], vs.GRAY)
-    cy = core.std.ShufflePlanes(c, [0], vs.GRAY)
+    clean = clean.ExtractY()
+    cy = c.ExtractY()
 
     # Spatial luma denoising
-    RG = core.rgsf.RemoveGrain if bd == 32 else core.rgvs.RemoveGrain
-    clean2 = RG(clean, rgmode) if rgmode > 0 else clean
+    clean2 = rgmode > 0 ? clean.RemoveGrain(rgmode) : clean
 
     # Apply dynamic noise reduction strength based on Luma
-    if strength <= 0:
+    if (strength <= 0)
+    {
         # Slightly widen the exclusion mask to preserve details and edges
-        cleanm = cy.std.Maximum()
-        if defH > 500:
-            cleanm = cleanm.std.Maximum()
-        if defH > 1200:
-            cleanm = cleanm.std.Maximum()
+        cleanm = cy.ex_Expand()
+        cleanm = defH > 500 ? cleanm.ex_Expand() : cleanm
+        cleanm = defH > 1200 ? cleanm.ex_Expand() : cleanm
 
         # Adjust mask levels
-        cleanm = cleanm.std.Levels((0 if fulls else 16) - strength, 255 if fulls else 235, 0.85, 0, 255+strength)
+        cleanm = cleanm.Levels((fulls ? 0 : 16) - strength, fulls ? 255 : 235, 0.85, 0, 255+strength)
 
         # Merge based on luma mask
-        clean = core.std.MaskedMerge(clean, cy, cleanm)
-        clean2 = core.std.MaskedMerge(clean2, cy, cleanm)
-        filt = core.std.MaskedMerge(filt, c, cleanm)
-    elif strength < 20:
+        clean = ex_Merge(clean, cy, cleanm)
+        clean2 = ex_Merge(clean2, cy, cleanm)
+        filt = ex_Merge(filt, c, cleanm)
+    }
+    else if (strength < 20)
+    {
         # Reduce strength by partially merging back with original
-        clean = core.std.Merge(cy, clean, 0.2+0.04*strength)
-        clean2 = core.std.Merge(cy, clean2, 0.2+0.04*strength)
-        filt = core.std.Merge(c, filt, 0.2+0.04*strength)
+        clean = Merge(cy, clean, 0.2+0.04*strength)
+        clean2 = Merge(cy, clean2, 0.2+0.04*strength)
+        filt = Merge(c, filt, 0.2+0.04*strength)
+    }
 
     # Unsharp filter for spatial detail enhancement
-    if sharp:
-        RE = core.rgsf.Repair if bd == 32 else core.rgvs.Repair
-        mult = .69 if method == 2 else .14 if method == 1 else 1
+    if (sharp > 0)
+    {
+        mult = method == 2 ? .69 : method == 1 ? .14 : 1
         sharp = min(50, (15 + defH * sharp * 0.0007) * mult)
-        clsharp = core.std.MakeDiff(clean, Sharpen(clean2, amountH=-0.08-0.03*sharp))
-        clsharp = core.std.MergeDiff(clean2, RE(clsharp.tmedian.TemporalMedian(), clsharp, 12))
+        clsharp = ex_MakeDiff(clean, clean2.Blur(0.08+0.03*sharp))
+        clsharp = ex_AddDiff(clean2, Repair(clsharp.TemporalMedian(), clsharp, 12))
+    }
     
     # If selected, combining ReNoise
-    noise_diff = core.std.MakeDiff(clean2, cy)
+    noise_diff = ex_MakeDiff(clean2, cy)
 
-    if rn:
-        i = 0.00392 if bd == 32 else 1 << (bd - 8)
-        peak = 1.0 if bd == 32 else (1 << bd) - 1
-        expr = "x {a} < 0 x {b} > {p} 0 x {c} - {p} {a} {d} - / * - ? ?".format(a=32*i, b=45*i, c=35*i, d=65*i, p=peak)
-        clean1 = core.std.Merge(clean2, core.std.MergeDiff(clean2, Tweak(noise_diff.tmedian.TemporalMedian(), cont=1.008+0.00016*rn)), 0.3+rn*0.035)
-        clean2 = core.std.MaskedMerge(clean2, clean1, core.std.Expr([core.std.Expr([clean, clean.std.Invert()], 'x y min')], [expr]))
+    if (rn > 0)
+    {
+        i = bd == 32 ? 0.00392 : BitLShift(1, (bd - 8))
+        peak = bd == 32 ? 1.0 : BitLShift(1, bd) - 1
+        expr = Format("x 32 {0} * < 0 x 45 {0} * > {1} 0 x 35 {0} * - {1} 32 {0} * 65 {0} * - / * - ? ?", i, peak)
+        clean1 = Merge(clean2, ex_AddDiff(clean2, Tweak(noise_diff.TemporalMedian(), cont=1.008+0.00016*rn)), 0.3+rn*0.035)
+        clean2 = ex_Merge(clean2, clean1, Expr(Expr(clean, clean.Invert(), "x y min"), expr))
+    }
 
     # Combining spatial detail enhancement with spatial noise reduction using prepared mask
-    noise_diff = noise_diff.std.Binarize().std.Invert()
-    if rgmode > 0:
-        clean2 = core.std.MaskedMerge(clean2, clsharp if sharp else clean, core.std.Expr([noise_diff, clean.std.Sobel()], 'x y max'))
+    noise_diff = noise_diff.ex_Binarize().Invert()
+    clean2 = rgmode > 0 ? ex_Merge(clean2, sharp > 0 ? clsharp : clean, Expr(noise_diff, clean.aSobel(), "x y max")) : clean2
 
     # Combining result of luma and chroma cleaning
-    return core.std.ShufflePlanes([clean2, filt], [0, 1, 2], vs.YUV) if c.format.color_family == vs.YUV else clean2
+    return (c.IsYUV || c.IsYUVA) ? MergeLuma(filt, clean2) : clean2
 }
 
 
 # mClean denoising method
-function x_MvTools(clip c, bool "chroma", int "defH", int "thSAD")
+function x_MvTools(clip c, int "defH", int "thSAD")
 {
     bd = c.BitsPerComponent
+    fulls = x_GetColorRange(c) == 0
     cy = c.ExtractY()
 
     sc = defH > 2880 ? 8 : defH > 1440 ? 4 : defH > 720 ? 2 : 1
     blksize = defH / sc > 360 ? 16 : 8
     overlap = blksize > 12 ? 6 : 2
     pel = defH > 720 ? 1 : 2
-    lampa = int(777 * pow(blksize, 2) / 64)
+    lambda = int(777 * pow(blksize, 2) / 64)
     truemotion = defH <= 720
 
-    ref = c.Blur(1.0)
-    super1 = S(chroma ? ref : ref.ExtractY(), hpad=blksize, vpad=blksize, pel=pel, rfilter=4, sharp=1)
-    super2 = S(chroma ? c : cy, hpad=blksize, vpad=blksize, pel=pel, rfilter=1, levels=1)
+    ref = c.GeneralConvolution(matrix="2 3 2 3 6 3 2 3 2")
+    super1 = MSuper(ref, hpad=blksize, vpad=blksize, pel=pel, rfilter=4, sharp=1)
+    super2 = MSuper(c, hpad=blksize, vpad=blksize, pel=pel, rfilter=1, levels=1)
 
     # Analysis
     bvec4       =  MRecalculate(super1, MAnalyse(super1, isb=true, delta=4, blksize=blksize, overlap=overlap, search=5, truemotion=truemotion),
@@ -426,68 +434,61 @@ function x_MvTools(clip c, bool "chroma", int "defH", int "thSAD")
                 \  blksize=blksize, overlap=overlap, search=5, truemotion=truemotion, lambda=lambda, thSAD=180)
 
     # Applying cleaning
-    clean = MDegrain4(chroma ? c : cy, super2, bvec1, fvec1, bvec2, fvec2, bvec3, fvec3, bvec4, fvec4, thsad=thSAD)
+    clean = MDegrain4(c, super2, bvec1, fvec1, bvec2, fvec2, bvec3, fvec3, bvec4, fvec4, thsad=thSAD)
 
-    clean = bd < 16 ? clean.fmtc_bitdepth(bits=16) : clean
-    c = bd < 16 ? c.fmtc_bitdepth(bits=16) : c
+    if (bd < 16)
+    {
+        clean = clean.x_ConvertBits(16, fulls, False)
+        c = c.x_ConvertBits(16, fulls, False)
+    }
 
-    uv = chroma ? mt_adddiff(clean, neo_tmedian(mt_makediff(c, clean, Y=1, U=3, V=3)), Y=1, U=3, V=3) : c
-    clean = c.IsY ? clean : MergeLuma(uv, clean, 1)
+    if (c.IsYUV || c.IsYUVA)
+    {
+        uv = ex_AddDiff(clean, neo_tmedian(ex_MakeDiff(c, clean, Y=1, UV=3)), Y=1, UV=3)
+        clean = MergeLuma(uv, clean)
+    }
     return clean
 }
 
 
-# SpotLess denoising method (m1=4) EXPERIMENTAL
-Function x_SpotLess(clip c, int "RadT", int "ThSAD", int "ThSAD2", int "pel", bool "chroma", int "BlkSz", int "Olap", bool "tm", bool "glob", float "bBlur")
-{
-    myName = "SpotLess: "
-    RadT     = Default(RadT,1)        # Temporal radius. (MCompensate arg)
-    ThSAD    = Default(ThSAD,10000)   # SAD threshold at radius 1 (Default Nearly OFF).
-    ThSAD2   = Default(ThSAD2,ThSAD)  # SAD threshold at radius RadT.
-    Pel      = Default(pel,2)         # Default 2. 1, 2, or 4. Maybe set 1 for HD+. (1=precision to pixel, 2=precision to half pixel, 4=quarter pixel)
-    Chroma   = Default(chroma,True)   # MAnalyse chroma arg. If set to true, use chroma in block matching.
-    BlkSz    = Default(BlkSz,8)       # Default 8. MAnalyse BlkSize. Bigger blksz quicker and perhaps  better, esp for HD clips. Maybe also better where BIG noise.
-    OLap     = Default(OLap, BlkSz/2) # Default half of BlkSz.
-    Tm       = Default(tm,True)       # TrueMotion, Some folk swear MAnalyse(truemotion=false) is better.
-    Glob     = Default(glob,True)     # Default True, Allow set MAnalyse(global) independently of TrueMotion.
-    Bblur    = Default(bblur,0.0)     # Default OFF
-    Assert(1 <= RadT,myName + " 1 <= RadT")
-    Assert(0.0 <= bblur <= 1.58, myName + "0.0 <= bblur <= 1.58")
-    Assert(pel==1 || pel==2 || pel==4, myName + "pel==1 || pel==2 || pel==4")
-    pad      = max(BlkSz,8)
-    sup      = (bBlur<=0.0  ? c   : c.blur(bblur)).MSuper(hpad=pad,vpad=pad,pel=pel,sharp=2)
-    sup_rend = (bBlur<=0.0) ? sup : c.MSuper(hpad=pad,vpad=pad,pel=pel,sharp=2,levels=1) # Only 1 Level required where not MAnalyse-ing.
-    MultiVec = sup.MAnalyse(multi=true, delta=RadT,blksize=BlkSz,overlap=OLap,chroma=Chroma,truemotion=Tm,global=Glob)
-    c.MCompensate(sup_rend, MultiVec, tr=RadT, thSad=ThSAD, thSad2=ThSAD2)
-    MedianBlurTemporal(radiusY=0,radiusU=0,radiusV=0,temporalradius=RadT)  # Temporal median blur only [not spatial]
-    SelectEvery(RadT*2+1,RadT)                                             # Return middle frame
-}
-
-
 # BM3D denoising method
-function x_BM3D(clip c, float "sigma", int "gpuid", bool  "chroma", clip "ref", int "m", int "block_step", int "bm_range", int "ps_range", bool "fullrange")
+function x_BM3D(clip c, clip "ref", float "sigma", int "gpuid", int "block_step", int "bm_range", int "ps_range", int "radius", bool "bm3d_fast")
 {
-    matrix = x_GetMatrixStr(c, fullrange)
-    clean = chroma ? c.fmtc_bitdepth(bits=32).ConvertToPlanarRGB(matrix=matrix) : c.ExtractY().fmtc_bitdepth(bits=32)
-    ref = Defined(ref) ? chroma ? ref.fmtc_bitdepth(bits=32).ConvertToPlanarRGB(matrix=matrix, ChromaInPlacement=loc) : ref.ExtractY().fmtc_bitdepth(bits=32) : Undefined()
+    fulls = x_GetColorRange(c) == 0
+    matrix = x_GetMatrixStr(c, fulls)
+    chroma = (c.IsYUV || c.IsYUVA)
     clean = gpuid >= 0 ? \
-        BM3D_CUDA(clean, sigma=sigma, ref=ref, block_step=block_step, bm_range=bm_range, ps_range=ps_range, device_id=gpuid, fast=False) : \
-        BM3D_CPU (clean, sigma=sigma, ref=ref, block_step=block_step, bm_range=bm_range, ps_range=ps_range)
-    return x_ConvertToM(clean, c, m, fullrange)
+        BM3D_CUDA(c, sigma=sigma, ref=ref, block_step=block_step, bm_range=bm_range, ps_range=ps_range, device_id=gpuid, fast=bm3d_fast, chroma=chroma) : \
+        BM3D_CPU (c, sigma=sigma, ref=ref, block_step=block_step, bm_range=bm_range, ps_range=ps_range, chroma=chroma)
+    clean = radius > 0 ? clean.BM3D_VAggregate() : clean
+    return clean
 }
 
 
 # KnlMeansCL denoising method, useful for dark noisy scenes
-function x_KnlMeans(clip c, int "d", int "a", float "h", int "gpuid", bool "chroma", clip "ref")
+function x_KnlMeans(clip c, clip ref, int "d", int "a", float "h", int "gpuid")
 {
-    ref = Defined(ref) ? ref.BitsPerComponent == c.BitsPerComponent ? ref : ref.fmtc_bitdepth(bits=c.BitsPerComponent) : Undefined()
+    bd = c.BitsPerComponent
+    fulls = x_GetColorRange(c) == 0
+    ref = Defined(ref) ? ref.BitsPerComponent == c.BitsPerComponent ? ref : ref.x_ConvertBits(bd, fulls, True) : Undefined()
+    src = c
     device = gpuid >= 0 ? "auto" : "cpu"
     gpuid = max(0, gpuid)
-    output = c.IsY ? c.KNLMeansCL(d=d, a=a, h=h, channels="Y", rclip=ref, device_type=device, device_id=gpuid) : Undefined()
-    output = c.Is444 ? c.KNLMeansCL(d=d, a=a, h=h, channels="YUV", rclip=ref, device_type=device, device_id=gpuid) : output
-    clean = Defined(output) ? output : c.KNLMeansCL(d=d, a=a, h=h, channels="Y", rclip=ref, device_type=device, device_id=gpuid)
-    uv = Defined(output) || !chroma ? clean : c.KNLMeansCL(d=d, a=a, h=h/2, channels="UV", rclip=ref, device_type=device, device_id=gpuid)
-    return MergeLuma(uv, clean, 1)
+    if (c.IsY)
+    {
+        output = c.KNLMeansCL(d=d, a=a, h=h, channels="Y", rclip=ref, device_type=device, device_id=gpuid)
+    }
+    else if (c.Is444)
+    {
+        output = c.KNLMeansCL(d=d, a=a, h=h, channels="YUV", rclip=ref, device_type=device, device_id=gpuid)
+    }
+    else
+    {
+        clean = c.KNLMeansCL(d=d, a=a, h=h, channels="Y", rclip=ref, device_type=device, device_id=gpuid)
+        uv = c.KNLMeansCL(d=d, a=a, h=h/2, channels="UV", rclip=ref, device_type=device, device_id=gpuid)
+        output = MergeLuma(uv, clean)
+    }
+    return output
 }
 
 
@@ -526,78 +527,38 @@ function x_GetMatrixStr(clip c)
 	
 }
 
-#function x_GetChromaLoc(clip c)
-#{
-#    return x_GetFrameProp(c, "_ChromaLocation", 0)
-#}
-
-#function x_GetChromaLocStr(clip c)
-#{
-#    loc = x_GetChromaLoc(c)
-#    return loc == 1 ? "MPEG1" : "MPEG2"
-#}
+function x_GetChromaLoc(clip c)
+{
+    return x_GetFrameProp(c, "_ChromaLocation", 0)
+}
 
 function x_ConvertBits(clip c, int "bits", bool "fulls", bool "dither")
 {
 	fulls = Default(fulls, c.IsRGB)
-	dither = Default(dither, False)
+	dither = Default(dither, False) && bits < c.BitsPerComponent
 	return c.ConvertBits(bits=bits, fulls=fulls, fulld=fulls, dither = dither ? 0 : -1)
 }
 
-# HBD constants 3D look up table
-#
-# * YUV and RGB mid-grey is 127.5 (rounded to 128) for PC range levels,
-#   this translates to a value of 125.5 in TV range levels. Chroma is always centered, so 128 regardless.
-function ex_dlut(string "str", int "bits", bool "fulls")
+
+# Converts matrix into desired format. If matrix is not specified, it will read matrix from source frame property.
+function x_ConvertMatrix(clip c, string "family", bool "fulls", int "matrix")
 {
-    str  = Default(str, "")
-    bits = Default(bits, 8)
-    fs   = Default(fulls, false)
+    matrix = Default(matrix, x_GetMatrix(c))
+    csp = BuildPixelType(family, c.BitsPerComponent)
+    if (matrix == 10)
+    {
+        return c.fmtc_matrix2020cl(csp=csp, full=fulls)
+    }
+    else
+    {
+        mat = Select(matrix, "RGB", "709", "601", "", "FCC", "601", "601", "240", "YCgCo", "2020", "", "", "", "")
+        Assert(mat != "", Format("ConvertMatrix: matrix {} is not supported.", matrix))
+        return c.fmtc_matrix(csp=csp, mat=mat, fulls=fulls, fulld=fulls)
+    }
+}
 
-    bitd =
-\     (bits ==  8         ) ? 0
-\   : (bits == 10         ) ? 1
-\   : (bits == 12         ) ? 2
-\   : (bits == 14         ) ? 3
-\   : (bits == 16         ) ? 4
-\   : (bits == 24         ) ? 5
-\   : (bits == 32         ) ? 6
-\   :  Assert (false, string(bits)+": Unsupported bit depth.")
-
-
-    #                            8-bit UINT      10-bit UINT          12-bit UINT          14-bit UINT            16-bit UINT         24-bit UINT               32-bit Ufloat
-    range_min   = Select (bitd,  [  0.,  0.],    [   0.,   0.   ],    [   0.,   0.   ],    [    0.,    0.   ],    [    0.,    0.],    [       0.,       0.],    [       0.,       0.])
-    ymin        = Select (bitd,  [ 16., 16.],    [  64.,  64.   ],    [ 256., 257.   ],    [ 1024., 1028.   ],    [ 4096., 4112.],    [ 1048576., 1052672.],    [  16/255.,  16/255.])
-    cmin        = Select (bitd,  [ 16., 16.],    [  64.,  64.   ],    [ 256., 257.   ],    [ 1024., 1028.   ],    [ 4096., 4112.],    [ 1048576., 1052672.],    [  16/255.,  16/255.])
-    ygrey       = Select (bitd,  [126.,126.],    [ 502., 504.   ],    [2008.,2016.   ],    [ 8032., 8063.   ],    [32128.,32254.],    [ 8224768., 8256896.],    [ 125.5/255.,125.5/255.])
-    range_half  = Select (bitd,  [128.,128.],    [ 512., 514.   ],    [2048.,2056.   ],    [ 8192., 8224.   ],    [32768.,32896.],    [ 8388608., 8421376.],    [ 128/255., 128/255.])
-    yrange      = Select (bitd,  [219.,219.],    [ 876., 879.   ],    [3504.,3517.688],    [14016.,14070.750],    [56064.,56283.],    [14352384.,14408448.],    [ 219/255., 219/255.])
-    crange      = Select (bitd,  [224.,224.],    [ 896., 899.500],    [3584.,3598.   ],    [14336.,14392.   ],    [57344.,57568.],    [14680064.,14737408.],    [ 224/255., 224/255.])
-    ymax        = Select (bitd,  [235.,235.],    [ 940., 943.672],    [3760.,3774.688],    [15040.,15098.750],    [60160.,60395.],    [15400960.,15461120.],    [ 235/255., 235/255.])
-    cmax        = Select (bitd,  [240.,240.],    [ 960., 963.750],    [3840.,3855.   ],    [15360.,15420.   ],    [61440.,61680.],    [15728640.,15790080.],    [ 240/255., 240/255.])
-    range_max   = Select (bitd,  [255.,255.],    [1020.,1023.984],    [4080.,4095.938],    [16320.,16383.750],    [65280.,65535.],    [16711680.,16776960.],    [       1.,       1.])
-    range_size  = Select (bitd,  [256.,256.],    [1024.,1024.   ],    [4096.,4096.   ],    [16384.,16384.   ],    [65536.,65536.],    [16777216.,16777216.],    [       1.,       1.])
-
-    fs  = fs ? 1 : 0
-    str = ReplaceStr(str, "ymax ymin - range_max /", string(yrange[fs]/range_max[fs]))
-    str = ReplaceStr(str, "cmax cmin - range_max /", string(crange[fs]/range_max[fs]))
-    str = ReplaceStr(str, "cmax ymin - range_max /", string(crange[fs]/range_max[fs]))
-    str = ReplaceStr(str, "range_max ymax ymin - /", string(range_max[fs]/yrange[fs]))
-    str = ReplaceStr(str, "range_max cmax cmin - /", string(range_max[fs]/crange[fs]))
-    str = ReplaceStr(str, "range_max cmax ymin - /", string(range_max[fs]/crange[fs]))
-    str = ReplaceStr(str, "ymax ymin -",             string(yrange[fs]))
-    str = ReplaceStr(str, "cmax ymin -",             string(crange[fs]))
-    str = ReplaceStr(str, "cmax cmin -",             string(crange[fs]))
-
-    str = ReplaceStr(str, "ygrey",                   string(ygrey[fs]))
-    str = ReplaceStr(str, "ymax",                    string(ymax[fs]))
-    str = ReplaceStr(str, "cmax",                    string(cmax[fs]))
-    str = ReplaceStr(str, "ymin",                    string(ymin[fs]))
-    str = ReplaceStr(str, "cmin",                    string(cmin[fs]))
-    str = ReplaceStr(str, "range_min",               string(range_min[fs]))
-    str = ReplaceStr(str, "range_half",              string(range_half[fs]))
-    str = ReplaceStr(str, "range_max",               string(range_max[fs]))
-    str = ReplaceStr(str, "range_size",              string(range_size[fs]))
-
-    return str
+function x_ClipSampling(clip c)
+{
+    return c.IsY ? "GRAY" : c.IsRGB ? "RGB" : \
+        c.Is444 ? "444" : c.Is422 ? "422" : c.Is420 ? "420" : "UNKNOWN"
 }

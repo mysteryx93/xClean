@@ -193,7 +193,7 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         chroma = "none"
         conv = False
     dochroma = chroma != "none" or samp == "RGB"
-    downchroma = downchroma or False if chroma == "reconstructor" else True
+    downchroma = downchroma if downchroma is not None else False if chroma == "reconstructor" else True
 
     gpucuda = gpucuda if gpucuda != None else gpuid
     bd = clip.format.bits_per_sample
@@ -422,7 +422,7 @@ def BM3D(clip: vs.VideoNode, ref: Optional[vs.VideoNode], sigma: float, gpuid: i
         clean = core.bm3dcuda_rtc.BM3D(clip, ref, chroma=chroma, sigma=sigma, device_id=gpuid, fast=bm3d_fast, radius=radius, block_step=block_step, bm_range=bm_range, ps_range=ps_range)
     else:
         clean = core.bm3dcpu.BM3D(clip, ref, chroma=chroma, sigma=sigma, block_step=block_step, bm_range=bm_range, ps_range=ps_range, radius=radius)
-    clean = clean.bm3d.VAggregate(sample=0 if icalc else 1) if radius > 0 else clean
+    clean = clean.bm3d.VAggregate(sample=0 if icalc else 1, radius=radius) if radius > 0 else clean
     return clean
 
 

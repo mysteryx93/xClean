@@ -1,8 +1,8 @@
 /*
 xClean 3-pass denoiser
-beta 8 (2021-11-10) by Etienne Charland
+beta 9 (2022-05-15) by Etienne Charland
 Supported formats: YUV, RGB, Y
-Requires: MaskTools2, MvTools2, KNLMeansCL, BM3DCUDA, aWarpSharpMT, Median, fmtconv, neo_f3kdb, neo_tmedian, nnedi3, nnedi3_resize16, SysInfo, Dogway Extools/TransformsPack/ChromaReconstructor
+Requires: MaskTools2, MvTools2, KNLMeansCL, BM3DCUDA, aWarpSharpMT, Median, fmtconv, neo_f3kdb, neo_tmedian, nnedi3, nnedi3_resize16, SysInfo, Dogway Extools/TransformsPack
 
 xClean runs MVTools -> BM3D -> KNLMeans in that order, passing the output of each pass as the ref of the next denoiser.
 
@@ -129,6 +129,14 @@ bicubic = bicubic(0, .5) upsampling
 nnedi3 = NNEDI3 upsampling
 reconstructor = feisty2's ChromaReconstructor_faster v3.0 HBD mod
 
+The following chroma upsampling values are also supported (may require additional dependencies)
+deep / FCBI / SuperResXBR / Krig / FSRCC / DPID / SSIM / SSIM2 / Nearest / Box / Bilinear / Quadratic / Gauss / Wiener / Spline / Spline16 / Spline36 / Spline64 / 
+Spline100 / Spline144 / Spline196 / Spline256 / Jinc / Jinc16 / Jinc36 / Jinc64 / Jinc100 / Jinc144 / Jinc196 / Jinc256 / EWASharp / EWASharp2 / EWASharp4 / 
+EWASharper / EWASharper2 / EWASharper4 / EWASharpest / EWASoft / Sinc / SincLin / SinPow / Welch / Cosine / Bessel / Wiener / Hamming / Hann / Kaiser / 
+Blackman / Black-Harris / Black-Nuttall / Nuttall / Bohman / Parzen / Lanczos / Ginseng / Flat-Top / MinSide / SoftCubic100 / Robidoux Soft / SoftCubic75 / BilcubicD / 
+BilcubicU / Hermite / Robidoux / Centroid / Mitchell-Netravali / Robidoux Sharp / SoftCubic50 / CatMule-Dog / Cub-grange / Catmull-Rom / Didee / Zopti / ZoptiN / ZoptiH / 
+Zopti720 / Zopti720U / Zopti1080 / Precise / Sharp / Hatch
+
 downchroma: whether to downscale back to match source clip. Default is False for reconstructor and True for other methods.
 
 +++ Anime +++
@@ -196,7 +204,7 @@ function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deb
     Assert(m3 >= 0 && m3 <= 3, "xClean: m3 (KNLMeansCL pass) can be 0 (disabled), 1 (8-bit), 2 (16-bit) or 3 (32-bit)")
     Assert(m1 > 0 || m2 > 0 || m3 > 0, "xClean: At least one pass must be enabled")
     Assert(outbits == 8 || outbits == 10 || outbits == 12 || outbits == 14 || outbits == 16 || outbits == 32, "xClean: outbits must be 8, 10, 12, 14, 16 or 32")
-    Assert(chroma=="none" || chroma=="bicubic" || chroma=="nnedi3" || chroma=="reconstructor", "xClean: chroma must be none, bicubic, nnedi3 or reconstructor")
+    #Assert(chroma=="none" || chroma=="bicubic" || chroma=="nnedi3" || chroma=="reconstructor", "xClean: chroma must be none, bicubic, nnedi3 or reconstructor")
 
     uv = clip
 	clip = chroma == "none" ? clip.ExtractY() : clip
@@ -215,9 +223,9 @@ function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deb
     # Reference clips are in RGB or GRAY format, to allow converting to desired formats
     cconv = bd < 16 ? x_ConvertBits(clip, 16, fulls, True) : clip
     cconv = clip.Is444 || clip.IsRGB || clip.IsY ? cconv : \
-        chroma == "reconstructor" ? ChromaReconstructor_faster(cconv, gpuid) : \
-        chroma == "nnedi3" ? nnedi3_resize16(cconv, tv_range=!fulls, output = bd < 32 ? "YUV444P16" : "YUV444PS") : \
-        fmtc_resample(clip, csp=bd < 32 ? "YUV444P16" : "YUV444PS" , kernel="bicubic", a1=0, a2=.5, fulls=fulls, fulld=fulls, cplace=cplace)
+        chroma == "reconstructor" ? x_ChromaReconstructor(cconv, gpuid=gpuid) : \
+        chroma == "bicubic" ? fmtc_resample(clip, csp=bd < 32 ? "YUV444P16" : "YUV444PS" , kernel="bicubic", a1=0, a2=.5, fulls=fulls, fulld=fulls, cplace=cplace) : \
+        ConvertFormat(cconv, fmt_out="44", kernel=chroma, tv_in=!fulls, tv_out=!fulls, cplace_in=cplace)
     cconv = conv && (clip.IsYUV || clip.IsYUVA) ? x_ConvertMatrix(cconv, "RGB", fulls) : cconv
     c32 = x_ConvertBits(cconv, 32, fulls, False)
     c16 = x_ConvertBits(cconv, 16, fulls, True)
@@ -297,7 +305,7 @@ function xClean(clip clip, string "chroma", float "sharp", float "rn", bool "deb
 
     # Convert to desired output format and bitrate
     output = conv ? YCoCgR_to_RGB(output) : output
-    if (clip.IsYUV || clip.IsYUVA)
+    if ((clip.IsYUV || clip.IsYUVA) && !clip.IsY)
     {
         output = x_ConvertMatrix(output, "YUV", fulls, matrix)
         if (downchroma && !clip.Is444)
@@ -456,10 +464,10 @@ function x_BM3D(clip c, clip "ref", float "sigma", int "gpuid", int "block_step"
 {
     fulls = x_GetColorRange(c) == 0
     matrix = x_GetMatrixStr(c, fulls)
-    chroma = (c.IsYUV || c.IsYUVA)
+    chroma = !c.IsY
     clean = gpuid >= 0 ? \
-        BM3D_CUDA(c, sigma=sigma, ref=ref, block_step=block_step, bm_range=bm_range, ps_range=ps_range, device_id=gpuid, fast=bm3d_fast, chroma=chroma) : \
-        BM3D_CPU (c, sigma=sigma, ref=ref, block_step=block_step, bm_range=bm_range, ps_range=ps_range, chroma=chroma)
+        BM3D_CUDA(c, ref=ref, chroma=chroma, sigma=sigma, block_step=block_step, bm_range=bm_range, ps_range=ps_range, device_id=gpuid, fast=bm3d_fast) : \
+        BM3D_CPU (c, ref=ref, chroma=chroma, sigma=sigma, block_step=block_step, bm_range=bm_range, ps_range=ps_range)
     clean = radius > 0 ? clean.BM3D_VAggregate() : clean
     return clean
 }
@@ -561,4 +569,35 @@ function x_ClipSampling(clip c)
 {
     return c.IsY ? "GRAY" : c.IsRGB ? "RGB" : \
         c.Is444 ? "444" : c.Is422 ? "422" : c.Is420 ? "420" : "UNKNOWN"
+}
+
+# DogWay's ChromaReconstructor_faster
+function x_ChromaReconstructor(clip src, int "gpuid", int "radius", float "str", int "threads") {
+
+        w       = src.width()
+        h       = src.height()
+        bi      = BitsPerComponent(src)
+        fs      = propNumElements (src,"_ColorRange")  > 0 ? \
+                  propGetInt      (src,"_ColorRange") == 0 : false
+
+        radius  = Default(radius, 16)
+        str     = Default(str,   6.4)
+        threads = Default(threads, 4)
+
+        cores   = SI_PhysicalCores()
+        threads = SI_LogicalCores()
+
+        Y   = ExtractY(src)
+        Uor = ExtractU(src)
+        Vor = ExtractV(src)
+
+        ref     =   Y.KNLMeansCL (0, radius, 0, pow(1.464968620512209618455732713658, str), "auto", device_id=gpuid, wref=1)
+        Luma    = ref.ConvertBits(8,dither=-1,fulls=fs).nnedi3_rpow2(rfactor=2, nns=1, qual=1, etype=1, nsize=0, threads=cores, prefetch=(threads+cores)/2, range=fs?1:2, cshift="spline16resize").ConvertBits(bi,fulls=fs)
+        Uu      = Uor.ConvertBits(8,dither=-1,fulls=fs).nnedi3_rpow2(rfactor=2, nns=1, qual=1, etype=1, nsize=0, threads=cores, prefetch=(threads+cores)/2, fwidth=w*2, fheight=h*2, ep0=6, cshift="blackmanresize", mpeg2=false,range=fs?1:2).ConvertBits(bi,fulls=fs)
+        Vu      = Vor.ConvertBits(8,dither=-1,fulls=fs).nnedi3_rpow2(rfactor=2, nns=1, qual=1, etype=1, nsize=0, threads=cores, prefetch=(threads+cores)/2, fwidth=w*2, fheight=h*2, ep0=6, cshift="blackmanresize", mpeg2=false,range=fs?1:2).ConvertBits(bi,fulls=fs)
+        Unew    = Uu.KNLMeansCL  (0, radius, 0, str, "auto", wref=0, rclip=Luma, device_id=gpuid).BicubicResize(w, h, b=0.0, c=0.5)
+        Vnew    = Vu.KNLMeansCL  (0, radius, 0, str, "auto", wref=0, rclip=Luma, device_id=gpuid).BicubicResize(w, h, b=0.0, c=0.5)
+        U       = ex_makeadddiff(Unew, Removegrain(Unew, 20), Uu.BicubicResize(w, h, b=0.0, c=0.5))  # Sharpening
+        V       = ex_makeadddiff(Vnew, Removegrain(Vnew, 20), Vu.BicubicResize(w, h, b=0.0, c=0.5))  # Sharpening
+        return CombinePlanes(Y, U, V, planes="YUV")
 }

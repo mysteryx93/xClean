@@ -574,7 +574,7 @@ def ConvertMatrix(c: vs.VideoNode, col_fam: int, fulls: bool, matrix: Optional[i
 
 
 # RGB to YCgCo RCT function
-def RGB_to_YCgCoR (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
+def RGB_to_YCgCoR (c: vs.VideoNode, fulls: bool = True) -> vs.VideoNode:
     if c.format.color_family != vs.RGB:
         raise TypeError("RGB_to_YCgCoR: Clip is not in RGB format!")
 
@@ -592,7 +592,7 @@ def RGB_to_YCgCoR (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
 
 
 #  YCgCo RCT to RGB function
-def YCgCoR_to_RGB (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
+def YCgCoR_to_RGB (c: vs.VideoNode, fulls: bool = True) -> vs.VideoNode:
     if c.format.color_family != vs.YUV:
         raise TypeError("YCgCoR_to_RGB: Clip is not in YUV format!")
 
@@ -609,7 +609,7 @@ def YCgCoR_to_RGB (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
     return output.std.SetFrameProp(prop='_Matrix', intval=0)
 
 
-def RGB_to_OPP (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
+def RGB_to_OPP (c: vs.VideoNode, fulls: bool = True) -> vs.VideoNode:
     if c.format.color_family != vs.RGB:
         raise TypeError("RGB_to_YCgCoR: Clip is not in RGB format!")
 
@@ -628,7 +628,7 @@ def RGB_to_OPP (c: vs.VideoNode, fulls: bool = False) -> vs.VideoNode:
     return output.std.SetFrameProp(prop='_Matrix', intval=2)
 
 
-def OPP_to_RGB (c: vs.VideoNode, fulls: bool = False):
+def OPP_to_RGB (c: vs.VideoNode, fulls: bool = True):
     if c.format.color_family != vs.YUV:
         raise TypeError("YCgCoR_to_RGB: Clip is not in YUV format!")
 

@@ -536,12 +536,6 @@ function x_GetMatrix(clip c)
     return matrix==0 || matrix==2 ? 6 : matrix
 }
 
-function x_GetMatrixStr(clip c)
-{
-    fulls = x_GetColorRange(c) == 0
-    matrix = x_GetMatrix(c)
-
-}
 
 function x_GetChromaLoc(clip c)
 {

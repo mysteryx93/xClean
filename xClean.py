@@ -6,9 +6,9 @@ import nnedi3_resample as nnedi3
 
 """
 xClean 3-pass denoiser
-beta 8 (2021-11-10) by Etienne Charland
+beta 9 (2022-05-15) by Etienne Charland
 Supported formats: YUV, RGB, GRAY
-Requires: rgsf, rgvs, fmtc, mv, mvsf, tmedian, knlm, bm3d, bm3dcuda_rtc, bm3dcpu, neo_f3kdb, akarin, nnedi3_resample, nnedi3cl
+Requires: rgsf, rgvs, fmtc, mv, mvsf, mvsfunc, knlm, bm3d, bm3dcuda_rtc, bm3dcpu, neo_tmedian, neo_f3kdb, akarin, nnedi3_resample, nnedi3cl
 
 xClean runs MVTools -> BM3D -> KNLMeans in that order, passing the output of each pass as the ref of the next denoiser.
 
@@ -30,7 +30,7 @@ BM3D performance can be greatly improved by setting radius=0, block_step=7, bm_r
 
 For 720p WebCam, optimal settings are: sharp=9.5, m1=.65, h=2.8
 For 288p anime, optimal settings are: sharp=9.5, m1=.7, rn=0, optional depth=1
-For 4-5K GoPro (with in-camera sharpening at Low), optimal settings are: sharp=7.7, m1=.5, m2=3.7, optional strength=-50 (or m1=.6, m2=3.8 if your computer can handle it)
+For 4-5K GoPro (with in-camera sharpening at Low), optimal settings are: sharp=7.7, m1=.5, m2=2.7, optional strength=-50 (or m1=.6, m2=2.8 if your computer can handle it)
 
 
 +++ Description +++
@@ -157,7 +157,7 @@ bm3d_fast = False. BM3D fast.
 conv = True. Whether to convert to OPP format for BM3D and YCgCoR for everything else. If false, it will process in standard YUV444.
 """
 
-def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: float = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .6, m2: int = 2, m3: int = 2, outbits: Optional[int] = None,
+def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: float = 14, deband: bool = False, depth: int = 0, strength: int = 20, m1: float = .6, m2: float = 2, m3: int = 2, outbits: Optional[int] = None,
         dmode: int = 0, rgmode: int = 18, thsad: int = 400, d: int = 2, a: int = 2, h: float = 1.4, gpuid: int = 0, gpucuda: Optional[int] = None, sigma: float = 9, 
         block_step: int = 4, bm_range: int = 16, ps_range: int = 8, radius: int = 0, bm3d_fast: bool = False, conv: bool = True, downchroma: bool = None) -> vs.VideoNode:
 
@@ -222,7 +222,7 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         m1 = int(m1)
         c1 = c32 if m1 == 3 else c16 if m1 == 2 else c8
         c1 = c1.fmtc.resample((width * m1r)//4*4, (height * m1r)//4*4, kernel="bicubic", a1=0, a2=.75) if m1r < 1 else c1
-        c1 = RGB_to_YCgCoR(c1, fulls) if conv else c1
+        c1 = RGB_to_YCgCoR(c1) if conv else c1
         output = MvTools(c1, defH, thsad)
         sharp1 = max(0, min(20, sharp + (1 - m1r) * .35))
         output = PostProcessing(output, c1, defH, strength, sharp1, rn, rgmode, 0)
@@ -234,16 +234,16 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         m2 = int(m2)
         m2o = max(2, max(m2, m3))
         c2 = c32 if m2o==3 else c16
-        ref = RGB_to_OPP(YCgCoR_to_RGB(output, fulls), fulls) if output and conv else output if output else None
+        ref = RGB_to_OPP(YCgCoR_to_RGB(output)) if output and conv else output if output else None
         ref = ref.fmtc.resample((width * m2r)//4*4, (height * m2r)//4*4, csp = vs.GRAYS if isGray else vs.YUV444PS, kernel = "spline36") if ref else None
         c2r = c2.fmtc.resample((width * m2r)//4*4, (height * m2r)//4*4, kernel = "bicubic", a1=0, a2=0.5) if m2r < 1 else c2
-        c2r = ConvertBits(RGB_to_OPP(c2r, fulls) if conv else c2r, 32, fulls, False)
+        c2r = ConvertBits(RGB_to_OPP(c2r) if conv else c2r, 32, fulls, False)
 
         output = BM3D(c2r, ref, sigma, gpucuda, block_step, bm_range, ps_range, radius, bm3d_fast)
         
         output = ConvertBits(output, c2.format.bits_per_sample, fulls, False)
-        output = RGB_to_YCgCoR(OPP_to_RGB(output, fulls), fulls) if conv else output
-        c2 = RGB_to_YCgCoR(c2, fulls) if conv else c2
+        output = RGB_to_YCgCoR(OPP_to_RGB(output)) if conv else output
+        c2 = RGB_to_YCgCoR(c2) if conv else c2
         output = output.fmtc.resample(width, height, kernel = "spline36") if m2r < 1 else output
         sharp2 = max(0, min(20, sharp + (1 - m2r) * .95))
         output = PostProcessing(output, c2, defH, strength, sharp2, rn, rgmode, 1)
@@ -256,7 +256,7 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
     if m3 > 0:
         m3 = min(2, m3) # KNL internally computes in 16-bit
         c3 = c32 if m3==3 else c16
-        c3 = RGB_to_YCgCoR(c3, fulls) if conv else c3
+        c3 = RGB_to_YCgCoR(c3) if conv else c3
         ref = ConvertBits(output, c3.format.bits_per_sample, fulls, False) if output else None
         output = KnlMeans(c3, ref, d, a, h, gpuid)
         # Adjust sharp based on h parameter.
@@ -277,7 +277,7 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         output = output.neo_f3kdb.Deband(range=16, preset="high" if dochroma else "luma", grainy=defH/15, grainc=defH/16 if dochroma else 0)
 
     # Convert to desired output format and bitrate
-    output = YCgCoR_to_RGB(output, fulls) if conv else output
+    output = YCgCoR_to_RGB(output) if conv else output
     if clip.format.color_family == vs.YUV:
         output = ConvertMatrix(output, vs.YUV, fulls, matrix)
         if downchroma and samp != "444":
@@ -343,7 +343,7 @@ def PostProcessing(clean: vs.VideoNode, c: vs.VideoNode, defH: int, strength: in
         mult = .69 if method == 2 else .14 if method == 1 else 1
         sharp = min(50, (15 + defH * sharp * 0.0007) * mult)
         clsharp = core.std.MakeDiff(clean, Sharpen(clean2, amountH=-0.08-0.03*sharp))
-        clsharp = core.std.MergeDiff(clean2, RE(clsharp.tmedian.TemporalMedian(), clsharp, 12))
+        clsharp = core.std.MergeDiff(clean2, RE(clsharp.neo_tmedian.TemporalMedian(), clsharp, 12))
     
     # If selected, combining ReNoise
     noise_diff = core.std.MakeDiff(clean2, cy)
@@ -352,7 +352,7 @@ def PostProcessing(clean: vs.VideoNode, c: vs.VideoNode, defH: int, strength: in
         i = 0.00392 if bd == 32 else 1 << (bd - 8)
         peak = 1.0 if bd == 32 else (1 << bd) - 1
         expr = "x {a} < 0 x {b} > {p} 0 x {c} - {p} {a} {d} - / * - ? ?".format(a=32*i, b=45*i, c=35*i, d=65*i, p=peak)
-        clean1 = core.std.Merge(clean2, core.std.MergeDiff(clean2, Tweak(noise_diff.tmedian.TemporalMedian(), cont=1.008+0.00016*rn)), 0.3+rn*0.035)
+        clean1 = core.std.Merge(clean2, core.std.MergeDiff(clean2, Tweak(noise_diff.neo_tmedian.TemporalMedian(), cont=1.008+0.00016*rn)), 0.3+rn*0.035)
         clean2 = core.std.MaskedMerge(clean2, clean1, core.std.Expr([core.std.Expr([clean, clean.std.Invert()], 'x y min')], [expr]))
 
     # Combining spatial detail enhancement with spatial noise reduction using prepared mask
@@ -407,7 +407,7 @@ def MvTools(c: vs.VideoNode, defH: int, thSAD: int) -> vs.VideoNode:
         c = ConvertBits(c, 16, fulls, False)
 
     if c.format.color_family == vs.YUV:
-        uv = core.std.MergeDiff(clean, core.tmedian.TemporalMedian(core.std.MakeDiff(c, clean, [1, 2]), 1, [1, 2]), [1, 2])
+        uv = core.std.MergeDiff(clean, core.neo_tmedian.TemporalMedian(core.std.MakeDiff(c, clean, [1, 2]), 1, [1, 2]), [1, 2])
         clean = core.std.ShufflePlanes(clips=[clean, uv], planes=[0, 1, 2], colorfamily=vs.YUV)
     return clean
 
@@ -415,7 +415,7 @@ def MvTools(c: vs.VideoNode, defH: int, thSAD: int) -> vs.VideoNode:
 # BM3D denoising method
 def BM3D(clip: vs.VideoNode, ref: Optional[vs.VideoNode], sigma: float, gpuid: int, block_step: int, bm_range: int, ps_range: int, radius: int, bm3d_fast: bool) -> vs.VideoNode:
     matrix = GetMatrix(clip)
-    fulls = GetColorRange(clip)
+    fulls = GetColorRange(clip) == 0
     chroma = clip.format.color_family==vs.YUV
     icalc = clip.format.bits_per_sample < 32
     if gpuid >= 0:
@@ -435,7 +435,6 @@ def KnlMeans(clip: vs.VideoNode, ref: Optional[vs.VideoNode], d: int, a: int, h:
     if ref and ref.format.bits_per_sample != bd:
         ref = ConvertBits(ref, bd, fulls, True)
     src = clip
-    sample = 1 if bd == 32 else 0
 
     device = dict(device_type="auto" if gpuid >= 0 else "cpu", device_id=max(0, gpuid))
     if clip.format.color_family == vs.GRAY:

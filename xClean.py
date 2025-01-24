@@ -235,7 +235,7 @@ def xClean(clip: vs.VideoNode, chroma: str = "nnedi3", sharp: float = 9.5, rn: f
         m2o = max(2, max(m2, m3))
         c2 = c32 if m2o==3 else c16
         ref = RGB_to_OPP(YCgCoR_to_RGB(output)) if output and conv else output if output else None
-        ref = ref.fmtc.resample((width * m2r)//4*4, (height * m2r)//4*4, csp = vs.GRAYS if isGray else vs.YUV444PS, kernel = "spline36") if ref else None
+        ref = ref.fmtc.resample((width * m2r)//4*4 if m2r < 1 else width, (height * m2r)//4*4 if m2r < 1 else height, csp = vs.GRAYS if isGray else vs.YUV444PS, kernel = "spline36") if ref else None
         c2r = c2.fmtc.resample((width * m2r)//4*4, (height * m2r)//4*4, kernel = "bicubic", a1=0, a2=0.5) if m2r < 1 else c2
         c2r = ConvertBits(RGB_to_OPP(c2r) if conv else c2r, 32, fulls, False)
 

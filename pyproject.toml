@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xclean"
+description = "xClean 3-pass denoiser for VapourSynth"
+version = "1.0.0"
+license = {text = "GPL-3.0"}
+authors = [
+  { name = "mysteryx93" },
+]
+readme = "README.md"
+
+requires-python = ">=3.9"
+
+dependencies = [
+  "VapourSynth >= 54"
+  # TODO: add nnedi3_resample when the pip package is available
+]
+
+[project.urls]
+Homepage = "https://github.com/mysteryx93/xClean"
+
+[tool.setuptools.package-data]
+xclean = ["py.typed"]
+
+[project.optional-dependencies]
+dev = ["toml"]

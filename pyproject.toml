@@ -22,8 +22,12 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/mysteryx93/xClean"
 
+[tool.setuptools]
+packages = ["xClean"]
+
 [tool.setuptools.package-data]
-xclean = ["py.typed"]
+xclean = ["xClean/py.typed"]
+exclude = ["xClean/*.avsi"]
 
 [project.optional-dependencies]
 dev = ["toml"]

@@ -22,9 +22,6 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/mysteryx93/xClean"
 
-[tool.setuptools]
-packages = ["."]
-
 [tool.setuptools.package-data]
 xclean = ["py.typed"]
 exclude = ["*.avsi"]
